@@ -9,3 +9,4 @@ langchain-openai==0.2.14
 langchain-core==0.3.28
 openai>=1.58.1
 gunicorn==21.2.0
+python-dotenv
