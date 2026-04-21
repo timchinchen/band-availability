@@ -256,6 +256,9 @@
             border: 1px solid var(--border);
             color: var(--text-primary);
             background: rgba(255, 255, 255, 0.08);
+            display: inline-flex;
+            align-items: center;
+            line-height: 1;
         }
 
         .chip.rehearsal {
@@ -307,6 +310,10 @@
             color: var(--text-secondary);
             font-size: 14px;
             line-height: 1.35;
+        }
+
+        .event-type {
+            margin-bottom: 8px;
         }
 
         .event-footer {
@@ -632,7 +639,7 @@
                                     <strong>${escapeHtml(formatDate(event.date))}</strong>
                                     <span class="time">${time}</span>
                                 </div>
-                                <div><span class="chip ${typeClass}">${escapeHtml(event.type)}</span></div>
+                                <div class="event-type"><span class="chip ${typeClass}">${escapeHtml(event.type)}</span></div>
                                 <div class="event-title">${escapeHtml(event.title)}</div>
                                 <div class="event-footer">Source: ${source}</div>
                             </li>
