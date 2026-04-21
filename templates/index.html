@@ -613,16 +613,16 @@
                 return null;
             }
 
-            const direct = new Date(cleaned);
-            if (!Number.isNaN(direct.getTime())) {
-                return direct;
-            }
-
             const ymdMatch = cleaned.match(/^(\d{4})-(\d{2})-(\d{2})$/);
             if (ymdMatch) {
                 const [, year, month, day] = ymdMatch;
                 const parsed = new Date(Number(year), Number(month) - 1, Number(day));
                 return Number.isNaN(parsed.getTime()) ? null : parsed;
+            }
+
+            const direct = new Date(cleaned);
+            if (!Number.isNaN(direct.getTime())) {
+                return new Date(direct.getFullYear(), direct.getMonth(), direct.getDate());
             }
 
             return null;
