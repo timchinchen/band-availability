@@ -637,16 +637,25 @@
                     return;
                 }
 
+                const excludedColumns = new Set(["event", "amount"]);
+                const visibleColumnIndexes = [];
+                schedule[0].forEach((header, index) => {
+                    const normalizedHeader = String(header || "").trim().toLowerCase();
+                    if (!excludedColumns.has(normalizedHeader)) {
+                        visibleColumnIndexes.push(index);
+                    }
+                });
+
                 let html = "<table><thead><tr>";
-                schedule[0].forEach((header) => {
-                    html += `<th>${escapeHtml(header)}</th>`;
+                visibleColumnIndexes.forEach((index) => {
+                    html += `<th>${escapeHtml(schedule[0][index] || "")}</th>`;
                 });
                 html += "</tr></thead><tbody>";
 
                 for (let i = 1; i < schedule.length; i += 1) {
                     html += "<tr>";
-                    schedule[i].forEach((cell) => {
-                        html += `<td>${escapeHtml(cell || "")}</td>`;
+                    visibleColumnIndexes.forEach((index) => {
+                        html += `<td>${escapeHtml(schedule[i][index] || "")}</td>`;
                     });
                     html += "</tr>";
                 }
