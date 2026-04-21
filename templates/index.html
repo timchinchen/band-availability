@@ -435,6 +435,28 @@
             background: rgba(255, 255, 255, 0.03);
         }
 
+        .schedule-row.today-row td {
+            background: rgba(255, 223, 106, 0.28);
+            color: #fff6d0;
+            border-bottom-color: rgba(255, 223, 106, 0.38);
+            font-weight: 600;
+        }
+
+        .schedule-row.event-row td {
+            background: rgba(242, 120, 203, 0.12);
+            border-bottom-color: rgba(242, 120, 203, 0.24);
+        }
+
+        .schedule-row.event-row td.event-cell {
+            color: #ffe48e;
+            font-weight: 700;
+        }
+
+        .schedule-row.weekend-row td {
+            background: rgba(255, 255, 255, 0.07);
+            color: #e8dbff;
+        }
+
         .message {
             color: var(--text-secondary);
             font-size: 14px;
@@ -573,6 +595,31 @@
             });
         }
 
+        function parseScheduleDate(value) {
+            if (!value) {
+                return null;
+            }
+
+            const cleaned = String(value).trim();
+            if (!cleaned) {
+                return null;
+            }
+
+            const direct = new Date(cleaned);
+            if (!Number.isNaN(direct.getTime())) {
+                return direct;
+            }
+
+            const ymdMatch = cleaned.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if (ymdMatch) {
+                const [, year, month, day] = ymdMatch;
+                const parsed = new Date(Number(year), Number(month) - 1, Number(day));
+                return Number.isNaN(parsed.getTime()) ? null : parsed;
+            }
+
+            return null;
+        }
+
         function getNextEventIndex(events) {
             const today = new Date();
             today.setHours(0, 0, 0, 0);
@@ -659,14 +706,25 @@
                     return;
                 }
 
-                const excludedColumns = new Set(["event", "amount"]);
+                const excludedColumns = new Set(["amount"]);
                 const visibleColumnIndexes = [];
+                let dateColumnIndex = -1;
+                let eventColumnIndex = -1;
                 schedule[0].forEach((header, index) => {
                     const normalizedHeader = String(header || "").trim().toLowerCase();
+                    if (normalizedHeader === "date") {
+                        dateColumnIndex = index;
+                    }
+                    if (normalizedHeader === "event") {
+                        eventColumnIndex = index;
+                    }
                     if (!excludedColumns.has(normalizedHeader)) {
                         visibleColumnIndexes.push(index);
                     }
                 });
+
+                const today = new Date();
+                today.setHours(0, 0, 0, 0);
 
                 let html = "<table><thead><tr>";
                 visibleColumnIndexes.forEach((index) => {
@@ -675,9 +733,28 @@
                 html += "</tr></thead><tbody>";
 
                 for (let i = 1; i < schedule.length; i += 1) {
-                    html += "<tr>";
+                    const row = schedule[i];
+                    const dateValue = dateColumnIndex >= 0 ? row[dateColumnIndex] : "";
+                    const parsedDate = parseScheduleDate(dateValue);
+                    const hasEvent = eventColumnIndex >= 0 && String(row[eventColumnIndex] || "").trim() !== "";
+                    const isToday = !!parsedDate && parsedDate.getTime() === today.getTime();
+                    const isWeekend = !!parsedDate && (parsedDate.getDay() === 0 || parsedDate.getDay() === 6);
+
+                    const rowClasses = ["schedule-row"];
+                    if (isToday) {
+                        rowClasses.push("today-row");
+                    }
+                    if (hasEvent) {
+                        rowClasses.push("event-row");
+                    } else if (isWeekend) {
+                        rowClasses.push("weekend-row");
+                    }
+
+                    html += `<tr class="${rowClasses.join(" ")}">`;
                     visibleColumnIndexes.forEach((index) => {
-                        html += `<td>${escapeHtml(schedule[i][index] || "")}</td>`;
+                        const isEventCell = eventColumnIndex === index;
+                        const cellClass = isEventCell ? ' class="event-cell"' : "";
+                        html += `<td${cellClass}>${escapeHtml(schedule[i][index] || "")}</td>`;
                     });
                     html += "</tr>";
                 }
