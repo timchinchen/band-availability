@@ -248,7 +248,7 @@
             flex-wrap: wrap;
         }
 
-        .chip {
+        .count-pill {
             border-radius: 999px;
             padding: 6px 11px;
             font-size: 12px;
@@ -256,14 +256,19 @@
             border: 1px solid var(--border);
             color: var(--text-primary);
             background: rgba(255, 255, 255, 0.08);
+            display: inline-flex;
+            align-items: center;
+            line-height: 1;
+            white-space: nowrap;
+            position: static;
         }
 
-        .chip.rehearsal {
+        .count-pill.rehearsal {
             background: rgba(127, 92, 255, 0.26);
             border-color: rgba(127, 92, 255, 0.56);
         }
 
-        .chip.gig {
+        .count-pill.gig {
             background: rgba(242, 120, 203, 0.22);
             border-color: rgba(242, 120, 203, 0.5);
         }
@@ -292,6 +297,12 @@
             margin-bottom: 8px;
         }
 
+        .event-date-group {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
         .event-meta strong {
             color: var(--text-primary);
             font-size: 13px;
@@ -307,6 +318,49 @@
             color: var(--text-secondary);
             font-size: 14px;
             line-height: 1.35;
+        }
+
+        .event-kind {
+            font-size: 11px;
+            letter-spacing: 0.4px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            font-weight: 700;
+        }
+
+        .event-kind.rehearsal {
+            color: #bda8ff;
+        }
+
+        .event-kind.gig {
+            color: #ffc2ea;
+        }
+
+        /* Compatibility guard: if older chip markup is rendered, keep it on its own row. */
+        .events-list .chip {
+            display: inline-flex;
+            align-items: center;
+            line-height: 1;
+            white-space: nowrap;
+            position: static;
+            margin: 0 0 8px 0;
+            vertical-align: middle;
+        }
+
+        .events-list li > div > .chip {
+            display: inline-flex;
+            align-items: center;
+            line-height: 1;
+            vertical-align: middle;
+        }
+
+        .events-list li > div:not(.event-meta):not(.event-title):not(.event-footer) {
+            margin-bottom: 8px;
+        }
+
+        .events-list li.next-event {
+            border-color: rgba(242, 120, 203, 0.52);
+            background: rgba(242, 120, 203, 0.09);
         }
 
         .event-footer {
@@ -455,8 +509,8 @@
                 </div>
 
                 <div class="event-counts">
-                    <span class="chip rehearsal" id="rehearsalCount">Rehearsals: -</span>
-                    <span class="chip gig" id="gigCount">Gigs: -</span>
+                    <span class="count-pill rehearsal" id="rehearsalCount">Rehearsals: -</span>
+                    <span class="count-pill gig" id="gigCount">Gigs: -</span>
                 </div>
 
                 <ul class="events-list" id="eventsList">
@@ -519,6 +573,38 @@
             });
         }
 
+        function getNextEventIndex(events) {
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+
+            for (let i = 0; i < events.length; i += 1) {
+                const eventDate = new Date(events[i].date);
+                if (!Number.isNaN(eventDate.getTime()) && eventDate >= today) {
+                    return i;
+                }
+            }
+            return events.length - 1;
+        }
+
+        function focusNextEvent(eventsList, events) {
+            if (!events.length) {
+                return;
+            }
+
+            const eventItems = eventsList.querySelectorAll("li.event-item");
+            if (!eventItems.length) {
+                return;
+            }
+
+            const nextIndex = getNextEventIndex(events);
+            const target = eventItems[nextIndex] || eventItems[0];
+            const top = Math.max(0, target.offsetTop - 20);
+            eventsList.scrollTop = top;
+
+            target.classList.add("next-event");
+            setTimeout(() => target.classList.remove("next-event"), 1800);
+        }
+
         async function loadMembers() {
             try {
                 const response = await fetch("/api/members");
@@ -573,16 +659,25 @@
                     return;
                 }
 
+                const excludedColumns = new Set(["event", "amount"]);
+                const visibleColumnIndexes = [];
+                schedule[0].forEach((header, index) => {
+                    const normalizedHeader = String(header || "").trim().toLowerCase();
+                    if (!excludedColumns.has(normalizedHeader)) {
+                        visibleColumnIndexes.push(index);
+                    }
+                });
+
                 let html = "<table><thead><tr>";
-                schedule[0].forEach((header) => {
-                    html += `<th>${escapeHtml(header)}</th>`;
+                visibleColumnIndexes.forEach((index) => {
+                    html += `<th>${escapeHtml(schedule[0][index] || "")}</th>`;
                 });
                 html += "</tr></thead><tbody>";
 
                 for (let i = 1; i < schedule.length; i += 1) {
                     html += "<tr>";
-                    schedule[i].forEach((cell) => {
-                        html += `<td>${escapeHtml(cell || "")}</td>`;
+                    visibleColumnIndexes.forEach((index) => {
+                        html += `<td>${escapeHtml(schedule[i][index] || "")}</td>`;
                     });
                     html += "</tr>";
                 }
@@ -624,20 +719,24 @@
                 } else {
                     eventsList.innerHTML = data.events.map((event) => {
                         const typeClass = event.type === "gig" ? "gig" : "rehearsal";
+                        const typeLabel = event.type === "gig" ? "Gig" : "Rehearsal";
                         const time = event.time ? escapeHtml(event.time) : "Time tbc";
                         const source = escapeHtml(event.source || "unknown");
                         return `
-                            <li>
+                            <li class="event-item">
                                 <div class="event-meta">
-                                    <strong>${escapeHtml(formatDate(event.date))}</strong>
+                                    <div class="event-date-group">
+                                        <strong>${escapeHtml(formatDate(event.date))}</strong>
+                                        <span class="event-kind ${typeClass}">${escapeHtml(typeLabel)}</span>
+                                    </div>
                                     <span class="time">${time}</span>
                                 </div>
-                                <div><span class="chip ${typeClass}">${escapeHtml(event.type)}</span></div>
                                 <div class="event-title">${escapeHtml(event.title)}</div>
                                 <div class="event-footer">Source: ${source}</div>
                             </li>
                         `;
                     }).join("");
+                    focusNextEvent(eventsList, data.events);
                 }
 
                 const calendarCount = data.sources?.calendar ?? 0;
