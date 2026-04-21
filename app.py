@@ -13,12 +13,11 @@ os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
-from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.output_parsers import PydanticOutputParser
-from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from googleapiclient.errors import HttpError
+from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
 import re
+from openai import OpenAI
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-change-this')
@@ -41,6 +40,7 @@ CLIENT_CONFIG = json.loads(os.environ["CLIENT_CONFIG"])
 # Environment variables
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-4o-mini')
 CALENDAR_IDS = [
     calendar_id.strip()
     for calendar_id in os.environ.get('CALENDAR_IDS', os.environ.get('CALENDAR_ID', 'primary')).split(',')
@@ -51,43 +51,143 @@ SCHEDULE_LOOKBACK_DAYS = 14
 SCHEDULE_LOOKAHEAD_DAYS = 120
 MAX_SCHEDULE_ROWS = 180
 KEY_EVENT_LIMIT = 20
+try:
+    CALENDAR_RETRY_BACKOFF_MINUTES = int(os.environ.get('CALENDAR_RETRY_BACKOFF_MINUTES', '60'))
+except ValueError:
+    CALENDAR_RETRY_BACKOFF_MINUTES = 60
+CALENDAR_RETRY_BACKOFF_MINUTES = max(5, min(1440, CALENDAR_RETRY_BACKOFF_MINUTES))
+CALENDAR_API_ENABLED = os.environ.get('CALENDAR_API_ENABLED', 'true').strip().lower() not in {'0', 'false', 'no'}
 
-# Pydantic models for structured output
-class AvailabilityUpdate(BaseModel):
-    dates: List[str] = Field(description="List of dates in YYYY-MM-DD format")
-    status: Literal["available", "unavailable"] = Field(
-        description="Whether the member is available or unavailable"
-    )
+EXCLUDED_MEMBER_HEADERS = {'date', 'event', 'amount', 'notes', 'venue'}
 
-# Initialize LangChain
-llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    api_key=OPENAI_API_KEY,
-    temperature=0
-)
-
-parser = PydanticOutputParser(pydantic_object=AvailabilityUpdate)
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are an AI assistant that parses natural language availability statements into structured data.
+AVAILABILITY_PARSE_PROMPT = """You parse natural language availability statements into JSON.
 Today's date is {today}.
 
 Extract:
-1. All specific dates mentioned (convert to YYYY-MM-DD format)
-2. Whether the person is available or unavailable for those dates
+1) dates: array of all dates mentioned in YYYY-MM-DD format.
+2) status: "available" or "unavailable".
 
-Common patterns:
-- "I can't do May 5th" = unavailable on 2025-05-05
-- "I'm available May 12" = available on 2025-05-12
-- "Not available next Tuesday" = calculate the date of next Tuesday from today
-- "Available all of June" = generate all dates in June
-- "Can't do the 5th" = assume current or next month depending on context
+Rules:
+- Resolve relative dates from today's date.
+- Return only strict JSON object: {{"dates": [...], "status": "available|unavailable"}}.
+- Do not include explanation or markdown."""
 
-Important: When parsing relative dates like "next Tuesday" or "the 5th", calculate from today's date.
+_openai_client: Optional[OpenAI] = None
+_calendar_retry_after: Optional[datetime] = None
+_calendar_unavailable_reason: Optional[str] = None
 
-{format_instructions}"""),
-    ("human", "{availability_text}")
-])
+
+@dataclass
+class AvailabilityUpdate:
+    dates: List[str]
+    status: str
+
+
+def get_openai_client() -> OpenAI:
+    """Lazily initialize OpenAI client to keep startup memory lower"""
+    global _openai_client
+    if _openai_client is None:
+        if not OPENAI_API_KEY:
+            raise Exception("OPENAI_API_KEY environment variable is not set")
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    return _openai_client
+
+
+def normalize_availability_payload(payload: Dict[str, Any]) -> AvailabilityUpdate:
+    """Validate and normalize LLM JSON payload"""
+    status = str(payload.get("status", "")).strip().lower()
+    if status not in {"available", "unavailable"}:
+        raise ValueError("Could not determine availability status")
+
+    raw_dates = payload.get("dates", [])
+    if not isinstance(raw_dates, list):
+        raise ValueError("Expected 'dates' to be a list")
+
+    normalized_dates: List[str] = []
+    seen = set()
+    for raw_date in raw_dates:
+        if not isinstance(raw_date, str):
+            continue
+        date_value = raw_date.strip()
+        try:
+            datetime.strptime(date_value, "%Y-%m-%d")
+        except ValueError:
+            continue
+        if date_value not in seen:
+            seen.add(date_value)
+            normalized_dates.append(date_value)
+
+    if not normalized_dates:
+        raise ValueError("No valid dates detected in availability update")
+
+    return AvailabilityUpdate(dates=normalized_dates, status=status)
+
+
+def is_calendar_disabled() -> Tuple[bool, Optional[str]]:
+    """Check whether calendar calls should be skipped for now"""
+    global _calendar_retry_after
+    now = datetime.now(timezone.utc)
+
+    if not CALENDAR_API_ENABLED:
+        return True, "Calendar integration disabled by CALENDAR_API_ENABLED"
+
+    if _calendar_retry_after and now < _calendar_retry_after:
+        minutes_remaining = int((_calendar_retry_after - now).total_seconds() // 60) + 1
+        reason = _calendar_unavailable_reason or "Calendar temporarily unavailable"
+        return True, f"{reason}. Retrying in about {minutes_remaining} minute(s)"
+
+    return False, None
+
+
+def disable_calendar_temporarily(reason: str):
+    """Back off calendar calls after known API/config failures"""
+    global _calendar_retry_after, _calendar_unavailable_reason
+    _calendar_unavailable_reason = reason
+    _calendar_retry_after = datetime.now(timezone.utc) + timedelta(minutes=CALENDAR_RETRY_BACKOFF_MINUTES)
+
+
+def should_disable_calendar_after_error(error: Exception) -> Optional[str]:
+    """Map Google Calendar API errors to a backoff reason"""
+    if isinstance(error, HttpError):
+        status_code = getattr(error.resp, "status", None)
+        message = str(error).lower()
+
+        if status_code == 403 and (
+            "accessnotconfigured" in message or
+            "has not been used in project" in message or
+            "api has not been used" in message
+        ):
+            return "Google Calendar API is not enabled for this project"
+        if status_code == 403:
+            return "Google Calendar access forbidden"
+        if status_code == 429:
+            return "Google Calendar quota exceeded"
+        if status_code in {500, 503}:
+            return "Google Calendar service unavailable"
+
+    return None
+
+
+def filter_member_headers(headers: List[str]) -> List[str]:
+    """Return only real member columns, excluding metadata columns"""
+    members: List[str] = []
+    for header in headers[1:]:
+        cleaned = header.strip()
+        if not cleaned:
+            continue
+        if cleaned.lower() in EXCLUDED_MEMBER_HEADERS:
+            continue
+        members.append(cleaned)
+    return members
+
+
+def find_member_column_index(headers: List[str], member_name: str) -> int:
+    """Find a member column by trimmed, case-insensitive header match"""
+    normalized_target = member_name.strip().lower()
+    for index, header in enumerate(headers):
+        if header.strip().lower() == normalized_target:
+            return index
+    raise ValueError(member_name)
 
 
 def get_sheets_service():
@@ -393,18 +493,30 @@ def combine_key_events(
 
 
 def parse_availability(availability_text: str) -> AvailabilityUpdate:
-    """Use LangChain to parse natural language availability"""
+    """Use OpenAI JSON mode to parse natural language availability"""
     today = datetime.now().strftime("%Y-%m-%d")
-    
-    chain = prompt | llm | parser
-    
-    result = chain.invoke({
-        "availability_text": availability_text,
-        "today": today,
-        "format_instructions": parser.get_format_instructions()
-    })
-    
-    return result
+    client = get_openai_client()
+
+    completion = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": AVAILABILITY_PARSE_PROMPT.format(today=today)},
+            {"role": "user", "content": availability_text}
+        ]
+    )
+
+    content = (completion.choices[0].message.content or "").strip()
+    if not content:
+        raise Exception("Availability parser returned an empty response")
+
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as json_error:
+        raise Exception("Availability parser returned invalid JSON") from json_error
+
+    return normalize_availability_payload(payload)
 
 
 def update_google_sheet(member_name: str, dates: List[str], status: str):
@@ -431,9 +543,12 @@ def update_google_sheet(member_name: str, dates: List[str], status: str):
     # Find member column
     headers = values[0]
     try:
-        member_col_index = headers.index(member_name)
+        member_col_index = find_member_column_index(headers, member_name)
     except ValueError:
-        raise Exception(f"Member '{member_name}' not found. Available: {', '.join(headers[1:])}")
+        raise Exception(
+            f"Member '{member_name}' not found. "
+            f"Available: {', '.join(filter_member_headers(headers))}"
+        )
     
     # Update dates
     updates = []
@@ -567,7 +682,7 @@ def get_members():
         headers = result.get('values', [[]])[0]
         print(f"Headers found: {headers}")
         
-        members = headers[1:] if len(headers) > 1 else []
+        members = filter_member_headers(headers) if len(headers) > 1 else []
         print(f"Members extracted: {members}")
         
         return jsonify({'members': members})
@@ -593,7 +708,7 @@ def update_availability():
         if 'credentials' not in session:
             return jsonify({'error': 'Not authenticated'}), 401
         
-        # Parse with LangChain
+        # Parse availability text with OpenAI
         parsed = parse_availability(availability_text)
         
         # Update sheet
@@ -696,13 +811,25 @@ def key_events():
         calendar_events: List[Dict[str, str]] = []
         calendar_error = None
         
-        calendar_service = get_calendar_service()
-        if calendar_service:
-            try:
-                calendar_events = summarize_calendar_key_events(calendar_service, limit=limit)
-            except Exception as calendar_exception:
-                calendar_error = str(calendar_exception)
-                print(f"Calendar summary warning: {calendar_error}")
+        calendar_disabled, disabled_reason = is_calendar_disabled()
+        if calendar_disabled:
+            calendar_error = disabled_reason
+        else:
+            calendar_service = get_calendar_service()
+            if calendar_service:
+                try:
+                    calendar_events = summarize_calendar_key_events(calendar_service, limit=limit)
+                except Exception as calendar_exception:
+                    disable_reason = should_disable_calendar_after_error(calendar_exception)
+                    if disable_reason:
+                        disable_calendar_temporarily(disable_reason)
+                        calendar_error = (
+                            f"{disable_reason}. Backing off calendar requests for "
+                            f"{CALENDAR_RETRY_BACKOFF_MINUTES} minute(s)."
+                        )
+                    else:
+                        calendar_error = str(calendar_exception)
+                    print(f"Calendar summary warning: {calendar_error}")
         
         events = combine_key_events(calendar_events, sheet_events, limit=limit)
         counts = {
@@ -717,7 +844,8 @@ def key_events():
                 'calendar': len(calendar_events),
                 'sheet': len(sheet_events)
             },
-            'calendar_error': calendar_error
+            'calendar_error': calendar_error,
+            'calendar_disabled': bool(calendar_error and not calendar_events)
         })
     
     except Exception as e:
