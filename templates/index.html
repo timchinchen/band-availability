@@ -5,246 +5,394 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Band Availability Tracker</title>
     <style>
+        :root {
+            --bg-deep: #090612;
+            --bg-mid: #15102b;
+            --surface: rgba(28, 20, 52, 0.88);
+            --surface-elevated: rgba(38, 25, 67, 0.95);
+            --border: rgba(208, 189, 255, 0.2);
+            --text-primary: #f6f0ff;
+            --text-secondary: #d6c3f9;
+            --text-muted: #a691ce;
+            --accent-violet: #7f5cff;
+            --accent-magenta: #c950c8;
+            --accent-pink: #f278cb;
+            --good: #72cb9f;
+            --bad: #ff8fb2;
+            --warning: #ffcd73;
+            --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+        }
+
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
         }
-        
+
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+            color: var(--text-primary);
             min-height: 100vh;
-            padding: 20px;
+            padding: 24px;
+            background:
+                radial-gradient(circle at 70% 14%, rgba(242, 120, 203, 0.35), transparent 30%),
+                radial-gradient(circle at 28% 22%, rgba(127, 92, 255, 0.45), transparent 34%),
+                linear-gradient(140deg, var(--bg-deep) 0%, #130c27 45%, var(--bg-mid) 100%);
         }
-        
+
         .container {
-            max-width: 1200px;
+            max-width: 1340px;
             margin: 0 auto;
         }
-        
+
         .header {
-            background: white;
+            background: var(--surface);
+            border: 1px solid var(--border);
             border-radius: 20px;
-            padding: 30px;
-            margin-bottom: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 24px 28px;
+            margin-bottom: 18px;
+            box-shadow: var(--shadow);
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 16px;
         }
-        
-        .header h1 {
-            color: #333;
-            font-size: 28px;
+
+        .title-wrap h1 {
+            font-size: 30px;
+            letter-spacing: 0.3px;
+            margin-bottom: 6px;
         }
-        
-        .logout-btn {
-            padding: 10px 20px;
-            background: #ff4757;
-            color: white;
-            border: none;
-            border-radius: 8px;
+
+        .title-wrap p {
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+
+        .ghost-btn,
+        .primary-btn {
+            border: 1px solid transparent;
+            border-radius: 10px;
             cursor: pointer;
             font-size: 14px;
             font-weight: 600;
-            transition: transform 0.2s;
+            transition: transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
         }
-        
-        .logout-btn:hover {
+
+        .ghost-btn {
+            padding: 10px 14px;
+            color: var(--text-primary);
+            background: rgba(255, 255, 255, 0.08);
+            border-color: var(--border);
+        }
+
+        .ghost-btn:hover,
+        .primary-btn:hover {
             transform: translateY(-2px);
         }
-        
-        .content {
+
+        .primary-btn {
+            padding: 12px 16px;
+            color: white;
+            background: linear-gradient(120deg, var(--accent-violet), var(--accent-magenta) 60%, var(--accent-pink));
+            box-shadow: 0 8px 24px rgba(201, 80, 200, 0.35);
+        }
+
+        .primary-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .layout {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 20px;
+            gap: 18px;
+            margin-bottom: 18px;
         }
-        
+
         .card {
-            background: white;
+            background: var(--surface);
+            border: 1px solid var(--border);
             border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            padding: 40px;
+            box-shadow: var(--shadow);
+            padding: 24px;
         }
-        
+
         .card h2 {
-            color: #333;
-            margin-bottom: 20px;
             font-size: 22px;
+            margin-bottom: 6px;
         }
-        
+
+        .subtle {
+            color: var(--text-secondary);
+            font-size: 13px;
+        }
+
         .form-group {
-            margin-bottom: 25px;
+            margin-top: 18px;
         }
-        
+
         label {
             display: block;
             margin-bottom: 8px;
-            color: #333;
+            color: var(--text-secondary);
             font-weight: 600;
-            font-size: 14px;
+            font-size: 13px;
         }
-        
-        select, textarea {
+
+        select,
+        textarea,
+        input[type="number"] {
             width: 100%;
-            padding: 12px;
-            border: 2px solid #e0e0e0;
-            border-radius: 8px;
-            font-size: 16px;
+            padding: 11px 12px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: var(--surface-elevated);
+            color: var(--text-primary);
+            font-size: 15px;
             font-family: inherit;
-            transition: border-color 0.3s;
         }
-        
-        select:focus, textarea:focus {
+
+        select:focus,
+        textarea:focus,
+        input[type="number"]:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: var(--accent-pink);
+            box-shadow: 0 0 0 3px rgba(242, 120, 203, 0.22);
         }
-        
+
         textarea {
             resize: vertical;
             min-height: 100px;
         }
-        
+
         .examples {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px;
             margin-top: 10px;
             font-size: 13px;
         }
-        
+
         .examples strong {
-            color: #667eea;
+            color: var(--text-primary);
             display: block;
             margin-bottom: 8px;
         }
-        
+
         .examples div {
-            color: #666;
+            color: var(--text-secondary);
             margin-bottom: 4px;
         }
-        
-        button[type="submit"] {
-            width: 100%;
-            padding: 15px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
-        }
-        
-        button[type="submit"]:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
-        }
-        
-        button[type="submit"]:active {
-            transform: translateY(0);
-        }
-        
-        button:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
-        }
-        
+
         .status {
-            margin-top: 20px;
-            padding: 15px;
-            border-radius: 8px;
+            margin-top: 14px;
+            padding: 12px;
+            border-radius: 10px;
             font-size: 14px;
             display: none;
         }
-        
+
         .status.success {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
             display: block;
+            background: rgba(114, 203, 159, 0.18);
+            border: 1px solid rgba(114, 203, 159, 0.45);
+            color: #d2ffe9;
         }
-        
+
         .status.error {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
             display: block;
+            background: rgba(255, 143, 178, 0.18);
+            border: 1px solid rgba(255, 143, 178, 0.4);
+            color: #ffd8e7;
         }
-        
+
         .status.loading {
-            background: #d1ecf1;
-            color: #0c5460;
-            border: 1px solid #bee5eb;
             display: block;
+            background: rgba(127, 92, 255, 0.2);
+            border: 1px solid rgba(127, 92, 255, 0.45);
+            color: #f1e8ff;
         }
-        
+
         .loader {
             display: inline-block;
-            width: 14px;
-            height: 14px;
-            border: 2px solid #0c5460;
+            width: 13px;
+            height: 13px;
+            border: 2px solid rgba(255, 255, 255, 0.9);
             border-top-color: transparent;
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
             margin-right: 8px;
         }
-        
+
         @keyframes spin {
-            to { transform: rotate(360deg); }
+            to {
+                transform: rotate(360deg);
+            }
         }
-        
+
+        .events-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+
+        .event-counts {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .chip {
+            border-radius: 999px;
+            padding: 6px 11px;
+            font-size: 12px;
+            font-weight: 700;
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            background: rgba(255, 255, 255, 0.08);
+        }
+
+        .chip.rehearsal {
+            background: rgba(127, 92, 255, 0.26);
+            border-color: rgba(127, 92, 255, 0.56);
+        }
+
+        .chip.gig {
+            background: rgba(242, 120, 203, 0.22);
+            border-color: rgba(242, 120, 203, 0.5);
+        }
+
+        .events-list {
+            list-style: none;
+            margin-top: 6px;
+            max-height: 364px;
+            overflow-y: auto;
+            padding-right: 4px;
+        }
+
+        .events-list li {
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 10px 12px;
+            margin-bottom: 10px;
+            background: rgba(255, 255, 255, 0.04);
+        }
+
+        .event-meta {
+            display: flex;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .event-meta strong {
+            color: var(--text-primary);
+            font-size: 13px;
+        }
+
+        .event-meta .time {
+            color: var(--warning);
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .event-title {
+            color: var(--text-secondary);
+            font-size: 14px;
+            line-height: 1.35;
+        }
+
+        .event-footer {
+            margin-top: 8px;
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .schedule-card {
+            grid-column: 1 / -1;
+        }
+
+        .schedule-controls {
+            margin-top: 12px;
+            margin-bottom: 12px;
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+            flex-wrap: wrap;
+        }
+
+        .field-inline {
+            min-width: 130px;
+        }
+
+        .field-inline label {
+            margin-bottom: 6px;
+        }
+
+        .schedule-info {
+            margin-top: 4px;
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+
         .schedule-table {
             width: 100%;
             overflow-x: auto;
+            border-radius: 12px;
+            border: 1px solid var(--border);
         }
-        
+
         table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 14px;
+            font-size: 13px;
         }
-        
-        th, td {
-            padding: 12px;
+
+        th,
+        td {
             text-align: left;
-            border-bottom: 1px solid #e0e0e0;
+            padding: 10px 12px;
+            border-bottom: 1px solid rgba(208, 189, 255, 0.14);
+            white-space: nowrap;
         }
-        
+
         th {
-            background: #f8f9fa;
-            font-weight: 600;
-            color: #333;
+            background: rgba(255, 255, 255, 0.07);
+            color: var(--text-primary);
+            font-size: 12px;
+            letter-spacing: 0.2px;
             position: sticky;
             top: 0;
+            z-index: 1;
         }
-        
+
         td {
-            color: #666;
+            color: var(--text-secondary);
         }
-        
-        .refresh-btn {
-            padding: 10px 20px;
-            background: #667eea;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
+
+        tr:hover td {
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .message {
+            color: var(--text-secondary);
             font-size: 14px;
-            font-weight: 600;
-            margin-bottom: 20px;
-            transition: transform 0.2s;
+            padding: 10px 2px;
         }
-        
-        .refresh-btn:hover {
-            transform: translateY(-2px);
+
+        .message.error {
+            color: var(--bad);
         }
-        
-        @media (max-width: 768px) {
-            .content {
+
+        @media (max-width: 960px) {
+            .layout {
                 grid-template-columns: 1fr;
             }
         }
@@ -253,14 +401,18 @@
 <body>
     <div class="container">
         <div class="header">
-            <h1>🎸 Band Availability Tracker</h1>
-            <button class="logout-btn" onclick="logout()">Logout</button>
+            <div class="title-wrap">
+                <h1>Band Availability Tracker</h1>
+                <p>Fast overlay for your spreadsheet schedule and key calendar events.</p>
+            </div>
+            <button class="ghost-btn" onclick="logout()">Logout</button>
         </div>
-        
-        <div class="content">
-            <div class="card">
+
+        <div class="layout">
+            <section class="card">
                 <h2>Update Availability</h2>
-                
+                <p class="subtle">Natural language updates are written directly into your sheet.</p>
+
                 <form id="availabilityForm">
                     <div class="form-group">
                         <label for="memberName">Your Name</label>
@@ -268,154 +420,286 @@
                             <option value="">Loading members...</option>
                         </select>
                     </div>
-                    
+
                     <div class="form-group">
                         <label for="availability">Availability Update</label>
-                        <textarea 
-                            id="availability" 
+                        <textarea
+                            id="availability"
                             placeholder="e.g., I can't do the 5th May or I'm available all of June"
                             required
                         ></textarea>
-                        
+
                         <div class="examples">
                             <strong>Example phrases:</strong>
-                            <div>• "I can't do the 5th May"</div>
-                            <div>• "I'm available May 12th and May 19th"</div>
-                            <div>• "Not available next Tuesday"</div>
-                            <div>• "I can make it on 2025-05-20"</div>
-                            <div>• "Available all of June except the 15th"</div>
+                            <div>- "I can't do the 5th May"</div>
+                            <div>- "I'm available May 12th and May 19th"</div>
+                            <div>- "Not available next Tuesday"</div>
+                            <div>- "I can make it on 2026-05-20"</div>
+                            <div>- "Available all of June except the 15th"</div>
                         </div>
                     </div>
-                    
-                    <button type="submit">Update Availability</button>
+
+                    <button class="primary-btn" type="submit">Update Availability</button>
                 </form>
-                
+
                 <div id="status" class="status"></div>
-            </div>
-            
-            <div class="card">
-                <h2>Current Schedule</h2>
-                <button class="refresh-btn" onclick="loadSchedule()">🔄 Refresh</button>
-                <div class="schedule-table" id="scheduleContainer">
-                    <p style="color: #666;">Loading schedule...</p>
+            </section>
+
+            <section class="card">
+                <div class="events-header">
+                    <div>
+                        <h2>Key Events</h2>
+                        <p class="subtle">Rehearsals and gigs from Calendar with sheet fallback.</p>
+                    </div>
+                    <button class="ghost-btn" onclick="loadKeyEvents()">Refresh</button>
                 </div>
-            </div>
+
+                <div class="event-counts">
+                    <span class="chip rehearsal" id="rehearsalCount">Rehearsals: -</span>
+                    <span class="chip gig" id="gigCount">Gigs: -</span>
+                </div>
+
+                <ul class="events-list" id="eventsList">
+                    <li class="message">Loading events...</li>
+                </ul>
+                <div class="schedule-info" id="eventSourceInfo"></div>
+            </section>
+
+            <section class="card schedule-card">
+                <h2>Current Schedule</h2>
+                <p class="subtle">Windowed date view for a more representative timeline.</p>
+
+                <div class="schedule-controls">
+                    <div class="field-inline">
+                        <label for="lookbackDays">Lookback days</label>
+                        <input type="number" id="lookbackDays" min="1" max="90" value="14">
+                    </div>
+                    <div class="field-inline">
+                        <label for="lookaheadDays">Lookahead days</label>
+                        <input type="number" id="lookaheadDays" min="7" max="365" value="120">
+                    </div>
+                    <div class="field-inline">
+                        <label for="maxRows">Max rows</label>
+                        <input type="number" id="maxRows" min="10" max="500" value="180">
+                    </div>
+                    <button class="ghost-btn" onclick="loadSchedule()">Refresh Schedule</button>
+                </div>
+
+                <div class="schedule-info" id="scheduleInfo"></div>
+                <div class="schedule-table" id="scheduleContainer">
+                    <p class="message">Loading schedule...</p>
+                </div>
+            </section>
         </div>
     </div>
 
     <script>
-        // Load members on page load
+        function escapeHtml(value) {
+            return String(value || "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#39;");
+        }
+
+        function formatDate(isoDate) {
+            if (!isoDate) {
+                return "-";
+            }
+            const parsed = new Date(isoDate);
+            if (Number.isNaN(parsed.getTime())) {
+                return isoDate;
+            }
+            return parsed.toLocaleDateString(undefined, {
+                weekday: "short",
+                day: "2-digit",
+                month: "short",
+                year: "numeric"
+            });
+        }
+
         async function loadMembers() {
             try {
-                const response = await fetch('/api/members');
+                const response = await fetch("/api/members");
                 const data = await response.json();
-                
+
                 if (response.ok && data.members) {
-                    const select = document.getElementById('memberName');
+                    const select = document.getElementById("memberName");
                     select.innerHTML = '<option value="">Select your name...</option>';
-                    
-                    data.members.forEach(member => {
-                        const option = document.createElement('option');
+
+                    data.members.forEach((member) => {
+                        const option = document.createElement("option");
                         option.value = member;
                         option.textContent = member;
                         select.appendChild(option);
                     });
                 } else {
-                    throw new Error(data.error || 'Failed to load members');
+                    throw new Error(data.error || "Failed to load members");
                 }
             } catch (error) {
-                console.error('Error loading members:', error);
-                document.getElementById('memberName').innerHTML = 
+                console.error("Error loading members:", error);
+                document.getElementById("memberName").innerHTML =
                     '<option value="">Error loading members</option>';
             }
         }
-        
-        // Load schedule
+
         async function loadSchedule() {
-            const container = document.getElementById('scheduleContainer');
-            container.innerHTML = '<p style="color: #666;">Loading schedule...</p>';
-            
+            const container = document.getElementById("scheduleContainer");
+            const scheduleInfo = document.getElementById("scheduleInfo");
+            container.innerHTML = '<p class="message">Loading schedule...</p>';
+            scheduleInfo.textContent = "";
+
+            const lookbackDays = document.getElementById("lookbackDays").value;
+            const lookaheadDays = document.getElementById("lookaheadDays").value;
+            const maxRows = document.getElementById("maxRows").value;
+            const params = new URLSearchParams({
+                lookbackDays,
+                lookaheadDays,
+                maxRows
+            });
+
             try {
-                const response = await fetch('/api/view-schedule');
+                const response = await fetch(`/api/view-schedule?${params.toString()}`);
                 const data = await response.json();
-                
-                if (response.ok && data.schedule) {
-                    const schedule = data.schedule;
-                    
-                    let html = '<table><thead><tr>';
-                    schedule[0].forEach(header => {
-                        html += `<th>${header}</th>`;
-                    });
-                    html += '</tr></thead><tbody>';
-                    
-                    for (let i = 1; i < schedule.length; i++) {
-                        html += '<tr>';
-                        schedule[i].forEach((cell, index) => {
-                            html += `<td>${cell || ''}</td>`;
-                        });
-                        html += '</tr>';
-                    }
-                    
-                    html += '</tbody></table>';
-                    container.innerHTML = html;
-                } else {
-                    throw new Error(data.error || 'Failed to load schedule');
+
+                if (!response.ok || !data.schedule) {
+                    throw new Error(data.error || "Failed to load schedule");
                 }
+
+                const schedule = data.schedule;
+                if (!schedule.length) {
+                    container.innerHTML = '<p class="message">No schedule data found.</p>';
+                    return;
+                }
+
+                let html = "<table><thead><tr>";
+                schedule[0].forEach((header) => {
+                    html += `<th>${escapeHtml(header)}</th>`;
+                });
+                html += "</tr></thead><tbody>";
+
+                for (let i = 1; i < schedule.length; i += 1) {
+                    html += "<tr>";
+                    schedule[i].forEach((cell) => {
+                        html += `<td>${escapeHtml(cell || "")}</td>`;
+                    });
+                    html += "</tr>";
+                }
+                html += "</tbody></table>";
+                container.innerHTML = html;
+
+                const windowInfo = data.window || {};
+                scheduleInfo.textContent =
+                    `Showing ${data.rows_returned || 0} of ${data.rows_total || 0} row(s) ` +
+                    `(window: -${windowInfo.lookback_days || "?"} / +${windowInfo.lookahead_days || "?"} days, max ${windowInfo.max_rows || "?"}).`;
             } catch (error) {
-                console.error('Error loading schedule:', error);
-                container.innerHTML = `<p style="color: #721c24;">Error: ${error.message}</p>`;
+                console.error("Error loading schedule:", error);
+                container.innerHTML = `<p class="message error">Error: ${escapeHtml(error.message)}</p>`;
             }
         }
-        
-        // Handle form submission
-        document.getElementById('availabilityForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            
-            const memberName = document.getElementById('memberName').value;
-            const availabilityText = document.getElementById('availability').value;
-            const statusDiv = document.getElementById('status');
-            
-            statusDiv.className = 'status loading';
-            statusDiv.innerHTML = '<span class="loader"></span>Processing your update...';
-            
+
+        async function loadKeyEvents() {
+            const eventsList = document.getElementById("eventsList");
+            const rehearsalCount = document.getElementById("rehearsalCount");
+            const gigCount = document.getElementById("gigCount");
+            const eventSourceInfo = document.getElementById("eventSourceInfo");
+
+            eventsList.innerHTML = '<li class="message">Loading events...</li>';
+            eventSourceInfo.textContent = "";
+
             try {
-                const response = await fetch('/api/update-availability', {
-                    method: 'POST',
+                const response = await fetch("/api/key-events");
+                const data = await response.json();
+
+                if (!response.ok || !Array.isArray(data.events)) {
+                    throw new Error(data.error || "Failed to load key events");
+                }
+
+                rehearsalCount.textContent = `Rehearsals: ${data.counts?.rehearsal ?? 0}`;
+                gigCount.textContent = `Gigs: ${data.counts?.gig ?? 0}`;
+
+                if (!data.events.length) {
+                    eventsList.innerHTML = "<li class='message'>No rehearsal or gig events found in the selected window.</li>";
+                } else {
+                    eventsList.innerHTML = data.events.map((event) => {
+                        const typeClass = event.type === "gig" ? "gig" : "rehearsal";
+                        const time = event.time ? escapeHtml(event.time) : "Time tbc";
+                        const source = escapeHtml(event.source || "unknown");
+                        return `
+                            <li>
+                                <div class="event-meta">
+                                    <strong>${escapeHtml(formatDate(event.date))}</strong>
+                                    <span class="time">${time}</span>
+                                </div>
+                                <div><span class="chip ${typeClass}">${escapeHtml(event.type)}</span></div>
+                                <div class="event-title">${escapeHtml(event.title)}</div>
+                                <div class="event-footer">Source: ${source}</div>
+                            </li>
+                        `;
+                    }).join("");
+                }
+
+                const calendarCount = data.sources?.calendar ?? 0;
+                const sheetCount = data.sources?.sheet ?? 0;
+                eventSourceInfo.textContent = `Loaded ${calendarCount} calendar and ${sheetCount} sheet event(s).`;
+                if (data.calendar_error) {
+                    eventSourceInfo.textContent += " Calendar source was unavailable for this session.";
+                }
+            } catch (error) {
+                console.error("Error loading key events:", error);
+                rehearsalCount.textContent = "Rehearsals: -";
+                gigCount.textContent = "Gigs: -";
+                eventsList.innerHTML = `<li class="message error">Error: ${escapeHtml(error.message)}</li>`;
+            }
+        }
+
+        document.getElementById("availabilityForm").addEventListener("submit", async (e) => {
+            e.preventDefault();
+
+            const memberName = document.getElementById("memberName").value;
+            const availabilityText = document.getElementById("availability").value;
+            const statusDiv = document.getElementById("status");
+
+            statusDiv.className = "status loading";
+            statusDiv.innerHTML = '<span class="loader"></span>Processing your update...';
+
+            try {
+                const response = await fetch("/api/update-availability", {
+                    method: "POST",
                     headers: {
-                        'Content-Type': 'application/json',
+                        "Content-Type": "application/json"
                     },
                     body: JSON.stringify({
                         memberName: memberName,
                         availabilityText: availabilityText
                     })
                 });
-                
+
                 const data = await response.json();
-                
-                if (response.ok) {
-                    statusDiv.className = 'status success';
-                    statusDiv.innerHTML = `✓ ${data.message}`;
-                    document.getElementById('availability').value = '';
-                    
-                    // Refresh schedule
-                    loadSchedule();
-                } else {
-                    throw new Error(data.error || 'Failed to update availability');
+                if (!response.ok) {
+                    throw new Error(data.error || "Failed to update availability");
                 }
+
+                statusDiv.className = "status success";
+                statusDiv.innerHTML = `Updated: ${escapeHtml(data.message)}`;
+                document.getElementById("availability").value = "";
+
+                loadSchedule();
+                loadKeyEvents();
             } catch (error) {
-                statusDiv.className = 'status error';
-                statusDiv.innerHTML = `✗ Error: ${error.message}`;
+                statusDiv.className = "status error";
+                statusDiv.innerHTML = `Error: ${escapeHtml(error.message)}`;
             }
         });
-        
-        // Logout function
+
         function logout() {
-            window.location.href = '/logout';
+            window.location.href = "/logout";
         }
-        
-        // Load data on page load
+
         loadMembers();
         loadSchedule();
+        loadKeyEvents();
     </script>
 </body>
 </html>
