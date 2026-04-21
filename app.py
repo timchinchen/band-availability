@@ -30,6 +30,9 @@ if os.getenv('RENDER') or os.getenv('HEROKU'):
 
 CORS(app)
 
+# Keep Google API client behavior lightweight for low-memory hosts.
+os.environ.setdefault('GOOGLE_API_USE_MTLS_ENDPOINT', 'never')
+
 # Google OAuth Configuration
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
@@ -196,7 +199,7 @@ def get_sheets_service():
         return None
     
     credentials = Credentials(**session['credentials'])
-    return build('sheets', 'v4', credentials=credentials)
+    return build('sheets', 'v4', credentials=credentials, cache_discovery=False)
 
 
 def get_calendar_service():
@@ -205,7 +208,7 @@ def get_calendar_service():
         return None
     
     credentials = Credentials(**session['credentials'])
-    return build('calendar', 'v3', credentials=credentials)
+    return build('calendar', 'v3', credentials=credentials, cache_discovery=False)
 
 
 def get_primary_sheet_name(service) -> str:
