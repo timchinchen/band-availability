@@ -248,7 +248,7 @@
             flex-wrap: wrap;
         }
 
-        .chip {
+        .count-pill {
             border-radius: 999px;
             padding: 6px 11px;
             font-size: 12px;
@@ -259,14 +259,16 @@
             display: inline-flex;
             align-items: center;
             line-height: 1;
+            white-space: nowrap;
+            position: static;
         }
 
-        .chip.rehearsal {
+        .count-pill.rehearsal {
             background: rgba(127, 92, 255, 0.26);
             border-color: rgba(127, 92, 255, 0.56);
         }
 
-        .chip.gig {
+        .count-pill.gig {
             background: rgba(242, 120, 203, 0.22);
             border-color: rgba(242, 120, 203, 0.5);
         }
@@ -485,8 +487,8 @@
                 </div>
 
                 <div class="event-counts">
-                    <span class="chip rehearsal" id="rehearsalCount">Rehearsals: -</span>
-                    <span class="chip gig" id="gigCount">Gigs: -</span>
+                    <span class="count-pill rehearsal" id="rehearsalCount">Rehearsals: -</span>
+                    <span class="count-pill gig" id="gigCount">Gigs: -</span>
                 </div>
 
                 <ul class="events-list" id="eventsList">
