@@ -336,6 +336,28 @@
             color: #ffc2ea;
         }
 
+        /* Compatibility guard: if older chip markup is rendered, keep it on its own row. */
+        .events-list .chip {
+            display: inline-flex;
+            align-items: center;
+            line-height: 1;
+            white-space: nowrap;
+            position: static;
+            margin: 0 0 8px 0;
+            vertical-align: middle;
+        }
+
+        .events-list li > div > .chip {
+            display: inline-flex;
+            align-items: center;
+            line-height: 1;
+            vertical-align: middle;
+        }
+
+        .events-list li > div:not(.event-meta):not(.event-title):not(.event-footer) {
+            margin-bottom: 8px;
+        }
+
         .events-list li.next-event {
             border-color: rgba(242, 120, 203, 0.52);
             background: rgba(242, 120, 203, 0.09);
