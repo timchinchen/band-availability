@@ -10,6 +10,8 @@ load_dotenv()
 
 # Allow OAuth over HTTP for local development
 os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+# Google may return previously granted scopes alongside new ones during upgrades.
+os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -39,6 +41,7 @@ SCOPES = [
     'https://www.googleapis.com/auth/calendar'
 ]
 CALENDAR_WRITE_SCOPE = 'https://www.googleapis.com/auth/calendar'
+CALENDAR_READONLY_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly'
 CLIENT_CONFIG = json.loads(os.environ["CLIENT_CONFIG"])
 
 # Environment variables
@@ -645,6 +648,17 @@ def sheet_event_to_google_body(event: Dict[str, str], timezone_name: str = CALEN
     }
 
 
+def normalize_granted_scopes(scopes: Optional[List[str]]) -> List[str]:
+    """Drop redundant calendar.readonly when full calendar access was granted"""
+    if not scopes:
+        return list(SCOPES)
+
+    normalized = list(scopes)
+    if CALENDAR_WRITE_SCOPE in normalized and CALENDAR_READONLY_SCOPE in normalized:
+        normalized = [scope for scope in normalized if scope != CALENDAR_READONLY_SCOPE]
+    return normalized
+
+
 def has_calendar_write_scope() -> bool:
     """Check whether the current session granted calendar write access"""
     credentials = session.get('credentials', {})
@@ -814,7 +828,7 @@ def authorize():
     
     authorization_url, state = flow.authorization_url(
         access_type='offline',
-        include_granted_scopes='true'
+        prompt='consent'
     )
     
     print(f"Redirect URI: {url_for('oauth2callback', _external=True)}")
@@ -841,7 +855,7 @@ def oauth2callback():
     )
     
     flow.fetch_token(authorization_response=request.url)
-    
+
     credentials = flow.credentials
     session['credentials'] = {
         'token': credentials.token,
@@ -849,7 +863,7 @@ def oauth2callback():
         'token_uri': credentials.token_uri,
         'client_id': credentials.client_id,
         'client_secret': credentials.client_secret,
-        'scopes': credentials.scopes
+        'scopes': normalize_granted_scopes(list(credentials.scopes or []))
     }
     
     print("OAuth credentials stored in session")
