@@ -237,9 +237,20 @@
         .events-header {
             display: flex;
             justify-content: space-between;
-            align-items: center;
+            align-items: flex-start;
             gap: 12px;
             margin-bottom: 14px;
+        }
+
+        .events-actions {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-width: 190px;
+        }
+
+        .events-actions .ghost-btn {
+            width: 100%;
         }
 
         .event-counts {
@@ -535,7 +546,10 @@
                         <h2>Key Events</h2>
                         <p class="subtle">Rehearsals and gigs from Calendar with sheet fallback.</p>
                     </div>
-                    <button class="ghost-btn" onclick="loadKeyEvents()">Refresh</button>
+                    <div class="events-actions">
+                        <button class="ghost-btn" onclick="loadKeyEvents()">Refresh</button>
+                        <button class="ghost-btn" id="syncCalendarBtn" onclick="syncKeyEventsToCalendar()">Sync to Google Calendar</button>
+                    </div>
                 </div>
 
                 <div class="event-counts">
@@ -835,6 +849,39 @@
                 rehearsalCount.textContent = "Rehearsals: -";
                 gigCount.textContent = "Gigs: -";
                 eventsList.innerHTML = `<li class="message error">Error: ${escapeHtml(error.message)}</li>`;
+            }
+        }
+
+        async function syncKeyEventsToCalendar() {
+            const eventSourceInfo = document.getElementById("eventSourceInfo");
+            const syncButton = document.getElementById("syncCalendarBtn");
+            const originalLabel = syncButton.textContent;
+
+            syncButton.disabled = true;
+            syncButton.textContent = "Syncing...";
+            eventSourceInfo.textContent = "Syncing sheet events to Google Calendar...";
+
+            try {
+                const response = await fetch("/api/sync-key-events-to-calendar", {
+                    method: "POST"
+                });
+                const data = await response.json();
+
+                if (!response.ok) {
+                    if (data.reauthorize_required) {
+                        throw new Error(`${data.error} Use Logout, then sign in again.`);
+                    }
+                    throw new Error(data.error || "Failed to sync events to Google Calendar");
+                }
+
+                eventSourceInfo.textContent = data.message || "Sync complete.";
+                await loadKeyEvents();
+            } catch (error) {
+                console.error("Error syncing key events:", error);
+                eventSourceInfo.textContent = `Sync error: ${error.message}`;
+            } finally {
+                syncButton.disabled = false;
+                syncButton.textContent = originalLabel;
             }
         }
 

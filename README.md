@@ -20,13 +20,13 @@ Instead of manually editing cells every time, users can:
 
 ## What the application does
 
-- **Google OAuth authentication** for secure access to Sheets (and optional Calendar read access).
+- **Google OAuth authentication** for secure access to Sheets and Google Calendar.
 - **Member-aware availability updates** written directly to Google Sheets.
 - **Schedule view** with a representative date window and visual emphasis for:
   - today's row,
   - rows with events,
   - weekend rows.
-- **Key Events panel** summarizing rehearsals and gigs from Calendar with sheet fallback.
+- **Key Events panel** summarizing rehearsals and gigs from Calendar with sheet fallback, plus one-click sync of sheet events to Google Calendar (uncertain times default to 7pm–midnight).
 - **Responsive UI overlay** optimized for quick coordination and at-a-glance decisions.
 
 ## Screenshot
@@ -53,6 +53,6 @@ gunicorn --config gunicorn.conf.py app:app
 
 - Python / Flask
 - Google Sheets API
-- Google Calendar API (read-only, optional)
+- Google Calendar API (read + sync to calendar, optional)
 - OpenAI API (for availability text parsing)
 - HTML/CSS/JavaScript frontend
