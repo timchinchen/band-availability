@@ -2,8 +2,10 @@ from flask import Flask, render_template, request, jsonify, session, redirect, u
 from flask_cors import CORS
 import os
 import json
-from datetime import date, datetime, time as dt_time, timedelta, timezone
+import gc
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+from threading import Lock
 
 # Load environment variables from .env file
 load_dotenv()
@@ -59,6 +61,21 @@ KEY_EVENT_LOOKAHEAD_DAYS = 365
 KEY_EVENT_LIMIT = 60
 KEY_EVENTS_SHEET_RANGE = 'A1:Z2000'
 try:
+    SHEET_METADATA_CACHE_SECONDS = int(os.environ.get('SHEET_METADATA_CACHE_SECONDS', '300'))
+except ValueError:
+    SHEET_METADATA_CACHE_SECONDS = 300
+SHEET_METADATA_CACHE_SECONDS = max(30, min(3600, SHEET_METADATA_CACHE_SECONDS))
+try:
+    SHEET_ROW_SCAN_LIMIT = int(os.environ.get('SHEET_ROW_SCAN_LIMIT', '1500'))
+except ValueError:
+    SHEET_ROW_SCAN_LIMIT = 1500
+SHEET_ROW_SCAN_LIMIT = max(200, min(5000, SHEET_ROW_SCAN_LIMIT))
+try:
+    REQUEST_GC_INTERVAL = int(os.environ.get('REQUEST_GC_INTERVAL', '60'))
+except ValueError:
+    REQUEST_GC_INTERVAL = 60
+REQUEST_GC_INTERVAL = max(0, min(2000, REQUEST_GC_INTERVAL))
+try:
     CALENDAR_RETRY_BACKOFF_MINUTES = int(os.environ.get('CALENDAR_RETRY_BACKOFF_MINUTES', '60'))
 except ValueError:
     CALENDAR_RETRY_BACKOFF_MINUTES = 60
@@ -84,6 +101,11 @@ Rules:
 _openai_client: Optional[OpenAI] = None
 _calendar_retry_after: Optional[datetime] = None
 _calendar_unavailable_reason: Optional[str] = None
+_sheet_name_cache_value: Optional[str] = None
+_sheet_name_cache_expiry: Optional[datetime] = None
+_sheet_name_cache_lock = Lock()
+_request_counter = 0
+_request_counter_lock = Lock()
 
 
 @dataclass
@@ -199,6 +221,19 @@ def find_member_column_index(headers: List[str], member_name: str) -> int:
     raise ValueError(member_name)
 
 
+def column_index_to_letter(index: int) -> str:
+    """Convert a 0-based column index into Google Sheets column letters."""
+    if index < 0:
+        raise ValueError("Column index must be >= 0")
+
+    letters: List[str] = []
+    current = index + 1
+    while current > 0:
+        current, remainder = divmod(current - 1, 26)
+        letters.append(chr(65 + remainder))
+    return ''.join(reversed(letters))
+
+
 def get_sheets_service():
     """Get authenticated Google Sheets service"""
     if 'credentials' not in session:
@@ -218,12 +253,91 @@ def get_calendar_service():
 
 
 def get_primary_sheet_name(service) -> str:
-    """Get the first sheet name from the spreadsheet"""
+    """Get first sheet name with short in-process cache."""
+    global _sheet_name_cache_value, _sheet_name_cache_expiry
+    now = datetime.now(timezone.utc)
+    with _sheet_name_cache_lock:
+        if (
+            _sheet_name_cache_value
+            and _sheet_name_cache_expiry
+            and now < _sheet_name_cache_expiry
+        ):
+            return _sheet_name_cache_value
+
     sheet_metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
     sheets = sheet_metadata.get('sheets', [])
     if not sheets:
         raise Exception("No sheets found in spreadsheet")
-    return sheets[0]['properties']['title']
+    sheet_name = sheets[0]['properties']['title']
+
+    with _sheet_name_cache_lock:
+        _sheet_name_cache_value = sheet_name
+        _sheet_name_cache_expiry = now + timedelta(seconds=SHEET_METADATA_CACHE_SECONDS)
+
+    return sheet_name
+
+
+def maybe_collect_garbage():
+    """Periodically trigger GC to curb growth on constrained hosts."""
+    global _request_counter
+    if REQUEST_GC_INTERVAL <= 0:
+        return
+
+    should_collect = False
+    with _request_counter_lock:
+        _request_counter += 1
+        if _request_counter >= REQUEST_GC_INTERVAL:
+            _request_counter = 0
+            should_collect = True
+
+    if should_collect:
+        gc.collect()
+
+
+@app.after_request
+def after_request_cleanup(response):
+    maybe_collect_garbage()
+    return response
+
+
+def get_sheet_values(service, sheet_name: str, range_suffix: str) -> List[List[str]]:
+    """Read a range from the active sheet and return row values."""
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f'{sheet_name}!{range_suffix}'
+    ).execute()
+    return result.get('values', [])
+
+
+def get_sheet_values_for_window(
+    service,
+    sheet_name: str,
+    lookback_days: int,
+    lookahead_days: int,
+    max_rows: int
+) -> List[List[str]]:
+    """Read only enough rows for windowed schedule rendering."""
+    row_limit = max(250, min(5000, lookback_days + lookahead_days + max_rows + 40))
+    return get_sheet_values(service, sheet_name, f"A1:Z{row_limit}")
+
+
+def get_sheet_values_for_update(service, sheet_name: str, requested_dates: List[str]) -> List[List[str]]:
+    """Read only enough rows to satisfy update operations."""
+    row_limit = max(250, min(SHEET_ROW_SCAN_LIMIT, len(requested_dates) + 80))
+    return get_sheet_values(service, sheet_name, f"A1:Z{row_limit}")
+
+
+def get_sheet_values_for_event_summary(service, sheet_name: str) -> List[List[str]]:
+    """Read a compact range for key-event extraction."""
+    return get_sheet_values(service, sheet_name, "A1:Z200")
+
+
+def clear_sheet_name_cache():
+    """Invalidate cached sheet metadata after structural updates."""
+    global _sheet_name_cache_value, _sheet_name_cache_expiry
+    with _sheet_name_cache_lock:
+        _sheet_name_cache_value = None
+        _sheet_name_cache_expiry = None
 
 
 def to_int(value: Optional[str], default: int, min_value: int = 1, max_value: int = 500) -> int:
@@ -741,13 +855,8 @@ def update_google_sheet(member_name: str, dates: List[str], status: str):
     sheet_name = get_primary_sheet_name(service)
     print(f"Updating sheet: {sheet_name}")
     
-    # Get current sheet data
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f'{sheet_name}!A1:Z1000'
-    ).execute()
-    
-    values = result.get('values', [])
+    # Get current sheet data (bounded range for memory control)
+    values = get_sheet_values(service, sheet_name, "A1:Z1000")
     
     if not values:
         raise Exception("Sheet is empty")
@@ -770,7 +879,7 @@ def update_google_sheet(member_name: str, dates: List[str], status: str):
         found = False
         for row_index, row in enumerate(values[1:], start=2):
             if len(row) > 0 and row[0] == date:
-                col_letter = chr(65 + member_col_index)
+                col_letter = column_index_to_letter(member_col_index)
                 cell = f"{col_letter}{row_index}"
                 
                 updates.append({
@@ -789,6 +898,7 @@ def update_google_sheet(member_name: str, dates: List[str], status: str):
             spreadsheetId=SPREADSHEET_ID,
             body=body
         ).execute()
+        clear_sheet_name_cache()
     
     return len(updates), dates_not_found
 
@@ -883,15 +993,9 @@ def get_members():
         sheet_name = get_primary_sheet_name(service)
         print(f"Using sheet: {sheet_name}")
         
-        # Fetch the first row
-        result = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f'{sheet_name}!A1:Z1'
-        ).execute()
-        
-        print(f"API Response: {result}")
-        
-        headers = result.get('values', [[]])[0]
+        # Fetch only header row
+        values = get_sheet_values(service, sheet_name, "A1:Z1")
+        headers = values[0] if values else []
         print(f"Headers found: {headers}")
         
         members = filter_member_headers(headers) if len(headers) > 1 else []
@@ -966,12 +1070,13 @@ def view_schedule():
         sheet_name = get_primary_sheet_name(service)
         print(f"Fetching schedule from sheet: {sheet_name}")
         
-        result = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f'{sheet_name}!A1:Z1000'
-        ).execute()
-        
-        raw_values = result.get('values', [])
+        raw_values = get_sheet_values_for_window(
+            service,
+            sheet_name,
+            lookback_days=lookback_days,
+            lookahead_days=lookahead_days,
+            max_rows=max_rows
+        )
         
         if not raw_values:
             return jsonify({'error': 'Sheet is empty'}), 404
@@ -1015,11 +1120,7 @@ def key_events():
         lookahead_days = to_int(request.args.get('lookaheadDays'), KEY_EVENT_LOOKAHEAD_DAYS, 30, 730)
         sheet_name = get_primary_sheet_name(service)
         
-        result = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f'{sheet_name}!{KEY_EVENTS_SHEET_RANGE}'
-        ).execute()
-        values = result.get('values', [])
+        values = get_sheet_values_for_event_summary(service, sheet_name)
         
         sheet_events = summarize_sheet_key_events(
             values,
