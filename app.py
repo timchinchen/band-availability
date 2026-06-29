@@ -2,7 +2,7 @@ from flask import Flask, render_template, request, jsonify, session, redirect, u
 from flask_cors import CORS
 import os
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -36,8 +36,9 @@ os.environ.setdefault('GOOGLE_API_USE_MTLS_ENDPOINT', 'never')
 # Google OAuth Configuration
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/calendar.readonly'
+    'https://www.googleapis.com/auth/calendar'
 ]
+CALENDAR_WRITE_SCOPE = 'https://www.googleapis.com/auth/calendar'
 CLIENT_CONFIG = json.loads(os.environ["CLIENT_CONFIG"])
 
 # Environment variables
@@ -53,13 +54,18 @@ CALENDAR_IDS = [
 SCHEDULE_LOOKBACK_DAYS = 14
 SCHEDULE_LOOKAHEAD_DAYS = 120
 MAX_SCHEDULE_ROWS = 180
-KEY_EVENT_LIMIT = 20
+KEY_EVENT_LOOKBACK_DAYS = 7
+KEY_EVENT_LOOKAHEAD_DAYS = 365
+KEY_EVENT_LIMIT = 60
+KEY_EVENTS_SHEET_RANGE = 'A1:Z2000'
 try:
     CALENDAR_RETRY_BACKOFF_MINUTES = int(os.environ.get('CALENDAR_RETRY_BACKOFF_MINUTES', '60'))
 except ValueError:
     CALENDAR_RETRY_BACKOFF_MINUTES = 60
 CALENDAR_RETRY_BACKOFF_MINUTES = max(5, min(1440, CALENDAR_RETRY_BACKOFF_MINUTES))
 CALENDAR_API_ENABLED = os.environ.get('CALENDAR_API_ENABLED', 'true').strip().lower() not in {'0', 'false', 'no'}
+CALENDAR_TIMEZONE = os.environ.get('CALENDAR_TIMEZONE', 'Europe/London')
+CALENDAR_WRITE_ID = os.environ.get('CALENDAR_WRITE_ID', '').strip() or (CALENDAR_IDS[0] if CALENDAR_IDS else 'primary')
 
 EXCLUDED_MEMBER_HEADERS = {'date', 'event', 'amount', 'notes', 'venue'}
 
@@ -332,7 +338,59 @@ def extract_time_text(text: str) -> str:
     return ""
 
 
-def summarize_sheet_key_events(values: List[List[str]], limit: int = KEY_EVENT_LIMIT) -> List[Dict[str, str]]:
+def parse_key_event_date(event: Dict[str, str]) -> date:
+    """Parse the ISO date on a key event record"""
+    return date.fromisoformat(event["date"])
+
+
+def filter_key_events_to_window(
+    events: List[Dict[str, str]],
+    lookback_days: int = KEY_EVENT_LOOKBACK_DAYS,
+    lookahead_days: int = KEY_EVENT_LOOKAHEAD_DAYS
+) -> List[Dict[str, str]]:
+    """Keep key events inside a forward-looking date window"""
+    today = date.today()
+    window_start = today - timedelta(days=lookback_days)
+    window_end = today + timedelta(days=lookahead_days)
+
+    windowed: List[Dict[str, str]] = []
+    for event in events:
+        event_date = parse_key_event_date(event)
+        if window_start <= event_date <= window_end:
+            windowed.append(event)
+
+    windowed.sort(key=lambda item: (item["date"], item["time"], item["title"].lower()))
+    return windowed
+
+
+def select_forward_looking_key_events(
+    events: List[Dict[str, str]],
+    limit: int = KEY_EVENT_LIMIT,
+    lookback_days: int = KEY_EVENT_LOOKBACK_DAYS,
+    lookahead_days: int = KEY_EVENT_LOOKAHEAD_DAYS
+) -> List[Dict[str, str]]:
+    """Prefer upcoming events, filling any remaining slots with recent past"""
+    windowed = filter_key_events_to_window(events, lookback_days, lookahead_days)
+    if len(windowed) <= limit:
+        return windowed
+
+    today = date.today()
+    upcoming = [event for event in windowed if parse_key_event_date(event) >= today]
+    recent_past = [event for event in windowed if parse_key_event_date(event) < today]
+
+    if len(upcoming) >= limit:
+        return upcoming[:limit]
+
+    past_slots = limit - len(upcoming)
+    selected_past = recent_past[-past_slots:] if past_slots else []
+    return selected_past + upcoming
+
+
+def summarize_sheet_key_events(
+    values: List[List[str]],
+    lookback_days: int = KEY_EVENT_LOOKBACK_DAYS,
+    lookahead_days: int = KEY_EVENT_LOOKAHEAD_DAYS
+) -> List[Dict[str, str]]:
     """Extract rehearsal and gig events from spreadsheet EVENT column"""
     if not values:
         return []
@@ -372,66 +430,19 @@ def summarize_sheet_key_events(values: List[List[str]], limit: int = KEY_EVENT_L
             "type": event_type,
             "source": "sheet"
         })
-    
-    extracted_events.sort(key=lambda item: item["date"])
-    return extracted_events[:limit]
+
+    return filter_key_events_to_window(extracted_events, lookback_days, lookahead_days)
 
 
-def parse_google_datetime(raw_value: Optional[str]) -> Optional[datetime]:
-    """Parse ISO datetime values returned by Google Calendar API"""
-    if not raw_value:
-        return None
-    
-    value = raw_value.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
-def format_calendar_event(event: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """Normalize a Google Calendar event into a key event record"""
-    summary = (event.get("summary") or "").strip()
-    description = (event.get("description") or "").strip()
-    combined_text = f"{summary} {description}".strip()
-    event_type = detect_event_type(combined_text)
-    if not event_type:
-        return None
-    
-    start = event.get("start", {})
-    end = event.get("end", {})
-    
-    if "dateTime" in start:
-        start_dt = parse_google_datetime(start.get("dateTime"))
-        end_dt = parse_google_datetime(end.get("dateTime"))
-        if not start_dt:
-            return None
-        date_value = start_dt.date().isoformat()
-        if end_dt:
-            time_value = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}"
-        else:
-            time_value = start_dt.strftime('%H:%M')
-    else:
-        date_value = start.get("date")
-        if not date_value:
-            return None
-        time_value = "All day"
-    
-    title = summary or "Untitled event"
-    return {
-        "date": date_value,
-        "time": time_value,
-        "title": title,
-        "type": event_type,
-        "source": "calendar"
-    }
-
-
-def summarize_calendar_key_events(calendar_service, limit: int = KEY_EVENT_LIMIT) -> List[Dict[str, str]]:
+def summarize_calendar_key_events(
+    calendar_service,
+    lookback_days: int = KEY_EVENT_LOOKBACK_DAYS,
+    lookahead_days: int = KEY_EVENT_LOOKAHEAD_DAYS
+) -> List[Dict[str, str]]:
     """Fetch and summarize rehearsal/gig events from Google Calendar"""
     now = datetime.now(timezone.utc)
-    time_min = (now - timedelta(days=SCHEDULE_LOOKBACK_DAYS)).isoformat()
-    time_max = (now + timedelta(days=SCHEDULE_LOOKAHEAD_DAYS)).isoformat()
+    time_min = (now - timedelta(days=lookback_days)).isoformat()
+    time_max = (now + timedelta(days=lookahead_days)).isoformat()
     
     events: List[Dict[str, str]] = []
     for calendar_id in CALENDAR_IDS:
@@ -461,38 +472,236 @@ def summarize_calendar_key_events(calendar_service, limit: int = KEY_EVENT_LIMIT
     deduped_events: List[Dict[str, str]] = []
     seen = set()
     for event in events:
-        key = (event["date"], event["title"].lower(), event["type"])
+        key = key_event_dedup_key(event)
         if key in seen:
             continue
         seen.add(key)
         deduped_events.append(event)
-        if len(deduped_events) >= limit:
-            break
-    
+
     return deduped_events
+
+
+def parse_google_datetime(raw_value: Optional[str]) -> Optional[datetime]:
+    """Parse ISO datetime values returned by Google Calendar API"""
+    if not raw_value:
+        return None
+
+    value = raw_value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def format_calendar_event(event: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Normalize a Google Calendar event into a key event record"""
+    summary = (event.get("summary") or "").strip()
+    description = (event.get("description") or "").strip()
+    combined_text = f"{summary} {description}".strip()
+    event_type = detect_event_type(combined_text)
+    if not event_type:
+        return None
+
+    start = event.get("start", {})
+    end = event.get("end", {})
+
+    if "dateTime" in start:
+        start_dt = parse_google_datetime(start.get("dateTime"))
+        end_dt = parse_google_datetime(end.get("dateTime"))
+        if not start_dt:
+            return None
+        date_value = start_dt.date().isoformat()
+        if end_dt:
+            time_value = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}"
+        else:
+            time_value = start_dt.strftime('%H:%M')
+    else:
+        date_value = start.get("date")
+        if not date_value:
+            return None
+        time_value = "All day"
+
+    title = summary or "Untitled event"
+    return {
+        "date": date_value,
+        "time": time_value,
+        "title": title,
+        "type": event_type,
+        "source": "calendar"
+    }
+
+
+def key_event_dedup_key(event: Dict[str, str]) -> Tuple[str, str, str]:
+    """Stable identity for matching sheet rows to calendar events"""
+    return (event["date"], event["title"].lower(), event["type"])
 
 
 def combine_key_events(
     calendar_events: List[Dict[str, str]],
-    sheet_events: List[Dict[str, str]],
-    limit: int = KEY_EVENT_LIMIT
+    sheet_events: List[Dict[str, str]]
 ) -> List[Dict[str, str]]:
     """Merge key events from calendar and sheet, deduplicated by date+title+type"""
     combined = calendar_events + sheet_events
     combined.sort(key=lambda item: (item["date"], item["time"], item["title"].lower()))
-    
+
     deduped: List[Dict[str, str]] = []
     seen = set()
     for event in combined:
-        key = (event["date"], event["title"].lower(), event["type"])
+        key = key_event_dedup_key(event)
         if key in seen:
             continue
         seen.add(key)
         deduped.append(event)
-        if len(deduped) >= limit:
-            break
-    
+
     return deduped
+
+
+def _parse_clock_token(token: str) -> Optional[Tuple[int, int]]:
+    """Parse a time token such as 7pm or 7:30pm into 24-hour (hour, minute)"""
+    cleaned = token.strip().lower()
+    match = re.match(r'^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$', cleaned)
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = (match.group(3) or '').lower()
+
+    if meridiem == 'pm' and hour != 12:
+        hour += 12
+    elif meridiem == 'am' and hour == 12:
+        hour = 0
+    elif not meridiem and 1 <= hour <= 11:
+        hour += 12
+
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute
+
+
+def default_evening_window(event_date: date) -> Tuple[datetime, datetime]:
+    """Default uncertain gig/rehearsal times to 7pm through midnight"""
+    start_dt = datetime.combine(event_date, dt_time(19, 0))
+    end_dt = datetime.combine(event_date + timedelta(days=1), dt_time(0, 0))
+    return start_dt, end_dt
+
+
+def event_start_end_datetimes(date_iso: str, time_text: str) -> Tuple[datetime, datetime]:
+    """Resolve sheet event start/end datetimes, defaulting TBC to 7pm-midnight"""
+    event_date = date.fromisoformat(date_iso)
+    default_start, default_end = default_evening_window(event_date)
+
+    if not time_text:
+        return default_start, default_end
+
+    normalized_time = time_text.strip().lower()
+    if normalized_time in {'tbc', 'time tbc', 'all day'}:
+        return default_start, default_end
+
+    range_match = re.match(r'^(.+?)\s*(?:-|–|to)\s*(.+)$', time_text.strip(), flags=re.IGNORECASE)
+    if range_match:
+        start_parts = _parse_clock_token(range_match.group(1))
+        end_parts = _parse_clock_token(range_match.group(2))
+        if start_parts and end_parts:
+            start_hour, start_minute = start_parts
+            end_hour, end_minute = end_parts
+            start_dt = datetime.combine(event_date, dt_time(start_hour, start_minute))
+            end_dt = datetime.combine(event_date, dt_time(end_hour, end_minute))
+            if end_dt <= start_dt:
+                end_dt += timedelta(days=1)
+            return start_dt, end_dt
+
+    single_parts = _parse_clock_token(time_text.strip())
+    if single_parts:
+        start_hour, start_minute = single_parts
+        start_dt = datetime.combine(event_date, dt_time(start_hour, start_minute))
+        return start_dt, default_end
+
+    return default_start, default_end
+
+
+def sheet_event_to_google_body(event: Dict[str, str], timezone_name: str = CALENDAR_TIMEZONE) -> Dict[str, Any]:
+    """Build a Google Calendar event payload from a sheet key event"""
+    start_dt, end_dt = event_start_end_datetimes(event["date"], event.get("time", ""))
+    dedup_key = "|".join(key_event_dedup_key(event))
+
+    return {
+        "summary": event["title"],
+        "description": f"Synced from band sheet ({event['type']}).",
+        "start": {
+            "dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            "timeZone": timezone_name
+        },
+        "end": {
+            "dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            "timeZone": timezone_name
+        },
+        "extendedProperties": {
+            "private": {
+                "bandAppSource": "sheet",
+                "bandAppKey": dedup_key
+            }
+        }
+    }
+
+
+def has_calendar_write_scope() -> bool:
+    """Check whether the current session granted calendar write access"""
+    credentials = session.get('credentials', {})
+    scopes = credentials.get('scopes') or []
+    return CALENDAR_WRITE_SCOPE in scopes
+
+
+def sync_sheet_events_to_calendar(
+    calendar_service,
+    sheet_events: List[Dict[str, str]],
+    calendar_events: List[Dict[str, str]],
+    calendar_id: str = CALENDAR_WRITE_ID
+) -> Dict[str, Any]:
+    """Create calendar events for sheet rows that are not already present"""
+    existing_keys = {key_event_dedup_key(event) for event in calendar_events}
+    created: List[Dict[str, str]] = []
+    skipped: List[Dict[str, str]] = []
+    errors: List[Dict[str, str]] = []
+
+    for event in sheet_events:
+        dedup_key = key_event_dedup_key(event)
+        if dedup_key in existing_keys:
+            skipped.append({
+                "date": event["date"],
+                "title": event["title"],
+                "reason": "already on calendar"
+            })
+            continue
+
+        try:
+            body = sheet_event_to_google_body(event)
+            calendar_service.events().insert(calendarId=calendar_id, body=body).execute()
+            existing_keys.add(dedup_key)
+            created.append({
+                "date": event["date"],
+                "title": event["title"],
+                "type": event["type"]
+            })
+        except HttpError as http_error:
+            errors.append({
+                "date": event["date"],
+                "title": event["title"],
+                "error": str(http_error)
+            })
+        except Exception as sync_error:
+            errors.append({
+                "date": event["date"],
+                "title": event["title"],
+                "error": str(sync_error)
+            })
+
+    return {
+        "created": created,
+        "skipped": skipped,
+        "errors": errors,
+        "calendar_id": calendar_id
+    }
 
 
 def parse_availability(availability_text: str) -> AvailabilityUpdate:
@@ -801,16 +1010,22 @@ def key_events():
         if not service:
             return jsonify({'error': 'Not authenticated'}), 401
         
-        limit = to_int(request.args.get('limit'), KEY_EVENT_LIMIT, 1, 100)
+        limit = to_int(request.args.get('limit'), KEY_EVENT_LIMIT, 1, 200)
+        lookback_days = to_int(request.args.get('lookbackDays'), KEY_EVENT_LOOKBACK_DAYS, 0, 90)
+        lookahead_days = to_int(request.args.get('lookaheadDays'), KEY_EVENT_LOOKAHEAD_DAYS, 30, 730)
         sheet_name = get_primary_sheet_name(service)
         
         result = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f'{sheet_name}!A1:Z1000'
+            range=f'{sheet_name}!{KEY_EVENTS_SHEET_RANGE}'
         ).execute()
         values = result.get('values', [])
         
-        sheet_events = summarize_sheet_key_events(values, limit=limit)
+        sheet_events = summarize_sheet_key_events(
+            values,
+            lookback_days=lookback_days,
+            lookahead_days=lookahead_days
+        )
         calendar_events: List[Dict[str, str]] = []
         calendar_error = None
         
@@ -821,7 +1036,11 @@ def key_events():
             calendar_service = get_calendar_service()
             if calendar_service:
                 try:
-                    calendar_events = summarize_calendar_key_events(calendar_service, limit=limit)
+                    calendar_events = summarize_calendar_key_events(
+                        calendar_service,
+                        lookback_days=lookback_days,
+                        lookahead_days=lookahead_days
+                    )
                 except Exception as calendar_exception:
                     disable_reason = should_disable_calendar_after_error(calendar_exception)
                     if disable_reason:
@@ -834,7 +1053,13 @@ def key_events():
                         calendar_error = str(calendar_exception)
                     print(f"Calendar summary warning: {calendar_error}")
         
-        events = combine_key_events(calendar_events, sheet_events, limit=limit)
+        combined_events = combine_key_events(calendar_events, sheet_events)
+        events = select_forward_looking_key_events(
+            combined_events,
+            limit=limit,
+            lookback_days=lookback_days,
+            lookahead_days=lookahead_days
+        )
         counts = {
             'rehearsal': sum(1 for event in events if event['type'] == 'rehearsal'),
             'gig': sum(1 for event in events if event['type'] == 'gig')
@@ -847,12 +1072,112 @@ def key_events():
                 'calendar': len(calendar_events),
                 'sheet': len(sheet_events)
             },
+            'window': {
+                'lookback_days': lookback_days,
+                'lookahead_days': lookahead_days,
+                'limit': limit,
+                'matched_total': len(combined_events),
+                'returned_total': len(events)
+            },
             'calendar_error': calendar_error,
             'calendar_disabled': bool(calendar_error and not calendar_events)
         })
     
     except Exception as e:
         print(f"ERROR in key_events: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sync-key-events-to-calendar', methods=['POST'])
+def sync_key_events_to_calendar():
+    """Create Google Calendar events for sheet-sourced rehearsals and gigs"""
+    try:
+        if 'credentials' not in session:
+            return jsonify({'error': 'Not authenticated'}), 401
+
+        if not has_calendar_write_scope():
+            return jsonify({
+                'error': (
+                    'Calendar write permission is required. Please log out and sign in again '
+                    'to grant Google Calendar access.'
+                ),
+                'reauthorize_required': True
+            }), 403
+
+        calendar_disabled, disabled_reason = is_calendar_disabled()
+        if calendar_disabled:
+            return jsonify({'error': disabled_reason or 'Calendar integration is unavailable'}), 503
+
+        sheets_service = get_sheets_service()
+        if not sheets_service:
+            return jsonify({'error': 'Not authenticated'}), 401
+
+        calendar_service = get_calendar_service()
+        if not calendar_service:
+            return jsonify({'error': 'Not authenticated with Google Calendar'}), 401
+
+        sheet_name = get_primary_sheet_name(sheets_service)
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f'{sheet_name}!{KEY_EVENTS_SHEET_RANGE}'
+        ).execute()
+        values = result.get('values', [])
+
+        sheet_events = summarize_sheet_key_events(
+            values,
+            lookback_days=KEY_EVENT_LOOKBACK_DAYS,
+            lookahead_days=KEY_EVENT_LOOKAHEAD_DAYS
+        )
+        if not sheet_events:
+            return jsonify({
+                'message': 'No sheet rehearsals or gigs found to sync.',
+                'created': [],
+                'skipped': [],
+                'errors': []
+            })
+
+        try:
+            calendar_events = summarize_calendar_key_events(
+                calendar_service,
+                lookback_days=KEY_EVENT_LOOKBACK_DAYS,
+                lookahead_days=KEY_EVENT_LOOKAHEAD_DAYS
+            )
+        except Exception as calendar_exception:
+            disable_reason = should_disable_calendar_after_error(calendar_exception)
+            if disable_reason:
+                disable_calendar_temporarily(disable_reason)
+            raise
+
+        sync_result = sync_sheet_events_to_calendar(
+            calendar_service,
+            sheet_events,
+            calendar_events
+        )
+
+        created_count = len(sync_result['created'])
+        skipped_count = len(sync_result['skipped'])
+        error_count = len(sync_result['errors'])
+
+        if created_count:
+            message = f'Added {created_count} event(s) to Google Calendar.'
+        else:
+            message = 'No new events were added to Google Calendar.'
+
+        if skipped_count:
+            message += f' Skipped {skipped_count} already on calendar.'
+        if error_count:
+            message += f' {error_count} event(s) failed.'
+
+        status_code = 200 if not error_count else 207
+        return jsonify({
+            'message': message,
+            **sync_result
+        }), status_code
+
+    except Exception as e:
+        print(f"ERROR in sync_key_events_to_calendar: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
