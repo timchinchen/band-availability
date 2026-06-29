@@ -16,6 +16,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from oauthlib.oauth2.rfc6749.errors import OAuth2Error
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import re
@@ -31,6 +32,10 @@ if os.getenv('RENDER') or os.getenv('HEROKU'):
     app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
 CORS(app)
+
+if os.getenv('RENDER') or os.getenv('HEROKU'):
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # Keep Google API client behavior lightweight for low-memory hosts.
 os.environ.setdefault('GOOGLE_API_USE_MTLS_ENDPOINT', 'never')
@@ -659,6 +664,32 @@ def normalize_granted_scopes(scopes: Optional[List[str]]) -> List[str]:
     return normalized
 
 
+def clear_oauth_session():
+    """Remove temporary OAuth state used during sign-in"""
+    session.pop('oauth_state', None)
+    session.pop('oauth_code_verifier', None)
+    session.pop('state', None)
+
+
+def store_oauth_flow_state(flow: Flow, state: str):
+    """Persist PKCE verifier and state across the Google redirect"""
+    session['oauth_state'] = state
+    session['oauth_code_verifier'] = flow.code_verifier
+    session['state'] = state
+
+
+def build_oauth_flow(state: Optional[str] = None, code_verifier: Optional[str] = None) -> Flow:
+    """Create an OAuth flow configured for this app"""
+    return Flow.from_client_config(
+        CLIENT_CONFIG,
+        scopes=SCOPES,
+        state=state,
+        redirect_uri=url_for('oauth2callback', _external=True),
+        code_verifier=code_verifier,
+        autogenerate_code_verifier=code_verifier is None
+    )
+
+
 def has_calendar_write_scope() -> bool:
     """Check whether the current session granted calendar write access"""
     credentials = session.get('credentials', {})
@@ -820,41 +851,68 @@ def index():
 def authorize():
     """Start OAuth flow"""
     print("=== STARTING OAUTH FLOW ===")
-    flow = Flow.from_client_config(
-        CLIENT_CONFIG,
-        scopes=SCOPES,
-        redirect_uri=url_for('oauth2callback', _external=True)
-    )
-    
+    clear_oauth_session()
+    flow = build_oauth_flow()
+
     authorization_url, state = flow.authorization_url(
-        access_type='offline',
-        prompt='consent'
+        access_type='offline'
     )
-    
+
     print(f"Redirect URI: {url_for('oauth2callback', _external=True)}")
     print(f"Authorization URL: {authorization_url}")
-    
-    session['state'] = state
+
+    store_oauth_flow_state(flow, state)
     return redirect(authorization_url)
 
 
-@app.route('/oauth2callback')
+@app.route('/oauth2callback', methods=['GET'])
 def oauth2callback():
     """OAuth callback"""
     print("=== OAUTH CALLBACK RECEIVED ===")
     print(f"Request URL: {request.url}")
-    print(f"Session state: {session.get('state', 'NOT FOUND')}")
-    
-    state = session['state']
-    
-    flow = Flow.from_client_config(
-        CLIENT_CONFIG,
-        scopes=SCOPES,
-        state=state,
-        redirect_uri=url_for('oauth2callback', _external=True)
-    )
-    
-    flow.fetch_token(authorization_response=request.url)
+    print(f"Session state: {session.get('oauth_state', session.get('state', 'NOT FOUND'))}")
+
+    oauth_error = request.args.get('error')
+    if oauth_error:
+        print(
+            "OAuth denied:",
+            oauth_error,
+            request.args.get('error_description', '')
+        )
+        clear_oauth_session()
+        return redirect(url_for('authorize'))
+
+    if not request.args.get('code'):
+        print("OAuth callback missing authorization code")
+        clear_oauth_session()
+        return redirect(url_for('authorize'))
+
+    state = session.get('oauth_state') or session.get('state')
+    code_verifier = session.get('oauth_code_verifier')
+    callback_state = request.args.get('state')
+
+    if not state or not code_verifier:
+        print("OAuth callback missing session PKCE state")
+        clear_oauth_session()
+        return redirect(url_for('authorize'))
+
+    if callback_state != state:
+        print(f"OAuth state mismatch: session={state}, callback={callback_state}")
+        clear_oauth_session()
+        return redirect(url_for('authorize'))
+
+    flow = build_oauth_flow(state=state, code_verifier=code_verifier)
+
+    try:
+        flow.fetch_token(authorization_response=request.url)
+    except OAuth2Error as oauth_exception:
+        print(f"OAuth token exchange failed: {oauth_exception}")
+        clear_oauth_session()
+        return redirect(url_for('authorize'))
+    except Exception as oauth_exception:
+        print(f"OAuth callback failed: {oauth_exception}")
+        clear_oauth_session()
+        return redirect(url_for('authorize'))
 
     credentials = flow.credentials
     session['credentials'] = {
@@ -865,16 +923,18 @@ def oauth2callback():
         'client_secret': credentials.client_secret,
         'scopes': normalize_granted_scopes(list(credentials.scopes or []))
     }
-    
+
+    clear_oauth_session()
     print("OAuth credentials stored in session")
     print(f"Credentials: token={credentials.token[:20]}...")
-    
+
     return redirect(url_for('index'))
 
 
 @app.route('/logout')
 def logout():
     """Clear session"""
+    clear_oauth_session()
     session.clear()
     return redirect(url_for('index'))
 
