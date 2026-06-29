@@ -287,7 +287,7 @@
         .events-list {
             list-style: none;
             margin-top: 6px;
-            max-height: 364px;
+            max-height: 520px;
             overflow-y: auto;
             padding-right: 4px;
         }
@@ -544,7 +544,7 @@
                 <div class="events-header">
                     <div>
                         <h2>Key Events</h2>
-                        <p class="subtle">Rehearsals and gigs from Calendar with sheet fallback.</p>
+                        <p class="subtle">Upcoming rehearsals and gigs from Calendar with sheet fallback (next year ahead).</p>
                     </div>
                     <div class="events-actions">
                         <button class="ghost-btn" onclick="loadKeyEvents()">Refresh</button>
@@ -803,7 +803,7 @@
             eventSourceInfo.textContent = "";
 
             try {
-                const response = await fetch("/api/key-events");
+                const response = await fetch("/api/key-events?lookaheadDays=365&limit=60");
                 const data = await response.json();
 
                 if (!response.ok || !Array.isArray(data.events)) {
@@ -840,7 +840,12 @@
 
                 const calendarCount = data.sources?.calendar ?? 0;
                 const sheetCount = data.sources?.sheet ?? 0;
-                eventSourceInfo.textContent = `Loaded ${calendarCount} calendar and ${sheetCount} sheet event(s).`;
+                const windowInfo = data.window || {};
+                eventSourceInfo.textContent =
+                    `Showing ${windowInfo.returned_total ?? data.events.length} of ` +
+                    `${windowInfo.matched_total ?? data.events.length} event(s) ` +
+                    `(window: -${windowInfo.lookback_days ?? "?"} / +${windowInfo.lookahead_days ?? "?"} days). ` +
+                    `Loaded ${calendarCount} calendar and ${sheetCount} sheet event(s) in range.`;
                 if (data.calendar_error) {
                     eventSourceInfo.textContent += " Calendar source was unavailable for this session.";
                 }

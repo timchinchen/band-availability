@@ -54,7 +54,10 @@ CALENDAR_IDS = [
 SCHEDULE_LOOKBACK_DAYS = 14
 SCHEDULE_LOOKAHEAD_DAYS = 120
 MAX_SCHEDULE_ROWS = 180
-KEY_EVENT_LIMIT = 20
+KEY_EVENT_LOOKBACK_DAYS = 7
+KEY_EVENT_LOOKAHEAD_DAYS = 365
+KEY_EVENT_LIMIT = 60
+KEY_EVENTS_SHEET_RANGE = 'A1:Z2000'
 try:
     CALENDAR_RETRY_BACKOFF_MINUTES = int(os.environ.get('CALENDAR_RETRY_BACKOFF_MINUTES', '60'))
 except ValueError:
@@ -63,7 +66,6 @@ CALENDAR_RETRY_BACKOFF_MINUTES = max(5, min(1440, CALENDAR_RETRY_BACKOFF_MINUTES
 CALENDAR_API_ENABLED = os.environ.get('CALENDAR_API_ENABLED', 'true').strip().lower() not in {'0', 'false', 'no'}
 CALENDAR_TIMEZONE = os.environ.get('CALENDAR_TIMEZONE', 'Europe/London')
 CALENDAR_WRITE_ID = os.environ.get('CALENDAR_WRITE_ID', '').strip() or (CALENDAR_IDS[0] if CALENDAR_IDS else 'primary')
-SYNC_EVENT_LIMIT = 100
 
 EXCLUDED_MEMBER_HEADERS = {'date', 'event', 'amount', 'notes', 'venue'}
 
@@ -336,7 +338,59 @@ def extract_time_text(text: str) -> str:
     return ""
 
 
-def summarize_sheet_key_events(values: List[List[str]], limit: int = KEY_EVENT_LIMIT) -> List[Dict[str, str]]:
+def parse_key_event_date(event: Dict[str, str]) -> date:
+    """Parse the ISO date on a key event record"""
+    return date.fromisoformat(event["date"])
+
+
+def filter_key_events_to_window(
+    events: List[Dict[str, str]],
+    lookback_days: int = KEY_EVENT_LOOKBACK_DAYS,
+    lookahead_days: int = KEY_EVENT_LOOKAHEAD_DAYS
+) -> List[Dict[str, str]]:
+    """Keep key events inside a forward-looking date window"""
+    today = date.today()
+    window_start = today - timedelta(days=lookback_days)
+    window_end = today + timedelta(days=lookahead_days)
+
+    windowed: List[Dict[str, str]] = []
+    for event in events:
+        event_date = parse_key_event_date(event)
+        if window_start <= event_date <= window_end:
+            windowed.append(event)
+
+    windowed.sort(key=lambda item: (item["date"], item["time"], item["title"].lower()))
+    return windowed
+
+
+def select_forward_looking_key_events(
+    events: List[Dict[str, str]],
+    limit: int = KEY_EVENT_LIMIT,
+    lookback_days: int = KEY_EVENT_LOOKBACK_DAYS,
+    lookahead_days: int = KEY_EVENT_LOOKAHEAD_DAYS
+) -> List[Dict[str, str]]:
+    """Prefer upcoming events, filling any remaining slots with recent past"""
+    windowed = filter_key_events_to_window(events, lookback_days, lookahead_days)
+    if len(windowed) <= limit:
+        return windowed
+
+    today = date.today()
+    upcoming = [event for event in windowed if parse_key_event_date(event) >= today]
+    recent_past = [event for event in windowed if parse_key_event_date(event) < today]
+
+    if len(upcoming) >= limit:
+        return upcoming[:limit]
+
+    past_slots = limit - len(upcoming)
+    selected_past = recent_past[-past_slots:] if past_slots else []
+    return selected_past + upcoming
+
+
+def summarize_sheet_key_events(
+    values: List[List[str]],
+    lookback_days: int = KEY_EVENT_LOOKBACK_DAYS,
+    lookahead_days: int = KEY_EVENT_LOOKAHEAD_DAYS
+) -> List[Dict[str, str]]:
     """Extract rehearsal and gig events from spreadsheet EVENT column"""
     if not values:
         return []
@@ -376,66 +430,19 @@ def summarize_sheet_key_events(values: List[List[str]], limit: int = KEY_EVENT_L
             "type": event_type,
             "source": "sheet"
         })
-    
-    extracted_events.sort(key=lambda item: item["date"])
-    return extracted_events[:limit]
+
+    return filter_key_events_to_window(extracted_events, lookback_days, lookahead_days)
 
 
-def parse_google_datetime(raw_value: Optional[str]) -> Optional[datetime]:
-    """Parse ISO datetime values returned by Google Calendar API"""
-    if not raw_value:
-        return None
-    
-    value = raw_value.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
-def format_calendar_event(event: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """Normalize a Google Calendar event into a key event record"""
-    summary = (event.get("summary") or "").strip()
-    description = (event.get("description") or "").strip()
-    combined_text = f"{summary} {description}".strip()
-    event_type = detect_event_type(combined_text)
-    if not event_type:
-        return None
-    
-    start = event.get("start", {})
-    end = event.get("end", {})
-    
-    if "dateTime" in start:
-        start_dt = parse_google_datetime(start.get("dateTime"))
-        end_dt = parse_google_datetime(end.get("dateTime"))
-        if not start_dt:
-            return None
-        date_value = start_dt.date().isoformat()
-        if end_dt:
-            time_value = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}"
-        else:
-            time_value = start_dt.strftime('%H:%M')
-    else:
-        date_value = start.get("date")
-        if not date_value:
-            return None
-        time_value = "All day"
-    
-    title = summary or "Untitled event"
-    return {
-        "date": date_value,
-        "time": time_value,
-        "title": title,
-        "type": event_type,
-        "source": "calendar"
-    }
-
-
-def summarize_calendar_key_events(calendar_service, limit: int = KEY_EVENT_LIMIT) -> List[Dict[str, str]]:
+def summarize_calendar_key_events(
+    calendar_service,
+    lookback_days: int = KEY_EVENT_LOOKBACK_DAYS,
+    lookahead_days: int = KEY_EVENT_LOOKAHEAD_DAYS
+) -> List[Dict[str, str]]:
     """Fetch and summarize rehearsal/gig events from Google Calendar"""
     now = datetime.now(timezone.utc)
-    time_min = (now - timedelta(days=SCHEDULE_LOOKBACK_DAYS)).isoformat()
-    time_max = (now + timedelta(days=SCHEDULE_LOOKAHEAD_DAYS)).isoformat()
+    time_min = (now - timedelta(days=lookback_days)).isoformat()
+    time_max = (now + timedelta(days=lookahead_days)).isoformat()
     
     events: List[Dict[str, str]] = []
     for calendar_id in CALENDAR_IDS:
@@ -470,10 +477,58 @@ def summarize_calendar_key_events(calendar_service, limit: int = KEY_EVENT_LIMIT
             continue
         seen.add(key)
         deduped_events.append(event)
-        if len(deduped_events) >= limit:
-            break
-    
+
     return deduped_events
+
+
+def parse_google_datetime(raw_value: Optional[str]) -> Optional[datetime]:
+    """Parse ISO datetime values returned by Google Calendar API"""
+    if not raw_value:
+        return None
+
+    value = raw_value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def format_calendar_event(event: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Normalize a Google Calendar event into a key event record"""
+    summary = (event.get("summary") or "").strip()
+    description = (event.get("description") or "").strip()
+    combined_text = f"{summary} {description}".strip()
+    event_type = detect_event_type(combined_text)
+    if not event_type:
+        return None
+
+    start = event.get("start", {})
+    end = event.get("end", {})
+
+    if "dateTime" in start:
+        start_dt = parse_google_datetime(start.get("dateTime"))
+        end_dt = parse_google_datetime(end.get("dateTime"))
+        if not start_dt:
+            return None
+        date_value = start_dt.date().isoformat()
+        if end_dt:
+            time_value = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}"
+        else:
+            time_value = start_dt.strftime('%H:%M')
+    else:
+        date_value = start.get("date")
+        if not date_value:
+            return None
+        time_value = "All day"
+
+    title = summary or "Untitled event"
+    return {
+        "date": date_value,
+        "time": time_value,
+        "title": title,
+        "type": event_type,
+        "source": "calendar"
+    }
 
 
 def key_event_dedup_key(event: Dict[str, str]) -> Tuple[str, str, str]:
@@ -483,13 +538,12 @@ def key_event_dedup_key(event: Dict[str, str]) -> Tuple[str, str, str]:
 
 def combine_key_events(
     calendar_events: List[Dict[str, str]],
-    sheet_events: List[Dict[str, str]],
-    limit: int = KEY_EVENT_LIMIT
+    sheet_events: List[Dict[str, str]]
 ) -> List[Dict[str, str]]:
     """Merge key events from calendar and sheet, deduplicated by date+title+type"""
     combined = calendar_events + sheet_events
     combined.sort(key=lambda item: (item["date"], item["time"], item["title"].lower()))
-    
+
     deduped: List[Dict[str, str]] = []
     seen = set()
     for event in combined:
@@ -498,9 +552,7 @@ def combine_key_events(
             continue
         seen.add(key)
         deduped.append(event)
-        if len(deduped) >= limit:
-            break
-    
+
     return deduped
 
 
@@ -958,16 +1010,22 @@ def key_events():
         if not service:
             return jsonify({'error': 'Not authenticated'}), 401
         
-        limit = to_int(request.args.get('limit'), KEY_EVENT_LIMIT, 1, 100)
+        limit = to_int(request.args.get('limit'), KEY_EVENT_LIMIT, 1, 200)
+        lookback_days = to_int(request.args.get('lookbackDays'), KEY_EVENT_LOOKBACK_DAYS, 0, 90)
+        lookahead_days = to_int(request.args.get('lookaheadDays'), KEY_EVENT_LOOKAHEAD_DAYS, 30, 730)
         sheet_name = get_primary_sheet_name(service)
         
         result = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f'{sheet_name}!A1:Z1000'
+            range=f'{sheet_name}!{KEY_EVENTS_SHEET_RANGE}'
         ).execute()
         values = result.get('values', [])
         
-        sheet_events = summarize_sheet_key_events(values, limit=limit)
+        sheet_events = summarize_sheet_key_events(
+            values,
+            lookback_days=lookback_days,
+            lookahead_days=lookahead_days
+        )
         calendar_events: List[Dict[str, str]] = []
         calendar_error = None
         
@@ -978,7 +1036,11 @@ def key_events():
             calendar_service = get_calendar_service()
             if calendar_service:
                 try:
-                    calendar_events = summarize_calendar_key_events(calendar_service, limit=limit)
+                    calendar_events = summarize_calendar_key_events(
+                        calendar_service,
+                        lookback_days=lookback_days,
+                        lookahead_days=lookahead_days
+                    )
                 except Exception as calendar_exception:
                     disable_reason = should_disable_calendar_after_error(calendar_exception)
                     if disable_reason:
@@ -991,7 +1053,13 @@ def key_events():
                         calendar_error = str(calendar_exception)
                     print(f"Calendar summary warning: {calendar_error}")
         
-        events = combine_key_events(calendar_events, sheet_events, limit=limit)
+        combined_events = combine_key_events(calendar_events, sheet_events)
+        events = select_forward_looking_key_events(
+            combined_events,
+            limit=limit,
+            lookback_days=lookback_days,
+            lookahead_days=lookahead_days
+        )
         counts = {
             'rehearsal': sum(1 for event in events if event['type'] == 'rehearsal'),
             'gig': sum(1 for event in events if event['type'] == 'gig')
@@ -1003,6 +1071,13 @@ def key_events():
             'sources': {
                 'calendar': len(calendar_events),
                 'sheet': len(sheet_events)
+            },
+            'window': {
+                'lookback_days': lookback_days,
+                'lookahead_days': lookahead_days,
+                'limit': limit,
+                'matched_total': len(combined_events),
+                'returned_total': len(events)
             },
             'calendar_error': calendar_error,
             'calendar_disabled': bool(calendar_error and not calendar_events)
@@ -1046,11 +1121,15 @@ def sync_key_events_to_calendar():
         sheet_name = get_primary_sheet_name(sheets_service)
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f'{sheet_name}!A1:Z1000'
+            range=f'{sheet_name}!{KEY_EVENTS_SHEET_RANGE}'
         ).execute()
         values = result.get('values', [])
 
-        sheet_events = summarize_sheet_key_events(values, limit=SYNC_EVENT_LIMIT)
+        sheet_events = summarize_sheet_key_events(
+            values,
+            lookback_days=KEY_EVENT_LOOKBACK_DAYS,
+            lookahead_days=KEY_EVENT_LOOKAHEAD_DAYS
+        )
         if not sheet_events:
             return jsonify({
                 'message': 'No sheet rehearsals or gigs found to sync.',
@@ -1060,7 +1139,11 @@ def sync_key_events_to_calendar():
             })
 
         try:
-            calendar_events = summarize_calendar_key_events(calendar_service, limit=SYNC_EVENT_LIMIT)
+            calendar_events = summarize_calendar_key_events(
+                calendar_service,
+                lookback_days=KEY_EVENT_LOOKBACK_DAYS,
+                lookahead_days=KEY_EVENT_LOOKAHEAD_DAYS
+            )
         except Exception as calendar_exception:
             disable_reason = should_disable_calendar_after_error(calendar_exception)
             if disable_reason:

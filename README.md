@@ -26,7 +26,7 @@ Instead of manually editing cells every time, users can:
   - today's row,
   - rows with events,
   - weekend rows.
-- **Key Events panel** summarizing rehearsals and gigs from Calendar with sheet fallback, plus one-click sync of sheet events to Google Calendar (uncertain times default to 7pm–midnight).
+- **Key Events panel** summarizing rehearsals and gigs from Calendar with sheet fallback across a forward-looking window (7 days back, 365 days ahead, up to 60 events), plus one-click sync of sheet events to Google Calendar (uncertain times default to 7pm–midnight).
 - **Responsive UI overlay** optimized for quick coordination and at-a-glance decisions.
 
 ## Screenshot
