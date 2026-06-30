@@ -69,6 +69,31 @@
             font-size: 14px;
         }
 
+        .connection-status {
+            font-size: 12px;
+            margin-top: 8px;
+            color: var(--text-muted);
+        }
+
+        .connection-status.connected {
+            color: var(--good);
+        }
+
+        .connection-status.warning {
+            color: var(--warning);
+        }
+
+        .connection-status.error {
+            color: var(--bad);
+        }
+
+        .header-actions {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 8px;
+        }
+
         .ghost-btn,
         .primary-btn {
             border: 1px solid transparent;
@@ -499,8 +524,11 @@
             <div class="title-wrap">
                 <h1>Band Availability Tracker</h1>
                 <p>Fast overlay for your spreadsheet schedule and key calendar events.</p>
+                <div class="connection-status" id="connectionStatus">Checking Google connection...</div>
             </div>
-            <button class="ghost-btn" onclick="logout()">Logout</button>
+            <div class="header-actions">
+                <button class="ghost-btn" onclick="logout()">Logout</button>
+            </div>
         </div>
 
         <div class="layout">
@@ -803,7 +831,7 @@
             eventSourceInfo.textContent = "";
 
             try {
-                const response = await fetch("/api/key-events?lookaheadDays=365&limit=60");
+                const response = await fetch("/api/key-events?lookaheadDays=365&limit=100");
                 const data = await response.json();
 
                 if (!response.ok || !Array.isArray(data.events)) {
@@ -847,7 +875,7 @@
                     `(window: -${windowInfo.lookback_days ?? "?"} / +${windowInfo.lookahead_days ?? "?"} days). ` +
                     `Loaded ${calendarCount} calendar and ${sheetCount} sheet event(s) in range.`;
                 if (data.calendar_error) {
-                    eventSourceInfo.textContent += " Calendar source was unavailable for this session.";
+                    eventSourceInfo.textContent += ` Calendar: ${data.calendar_error}`;
                 }
             } catch (error) {
                 console.error("Error loading key events:", error);
@@ -929,10 +957,49 @@
             }
         });
 
-        function logout() {
-            window.location.href = "/logout";
+        async function loadSessionStatus() {
+            const statusEl = document.getElementById("connectionStatus");
+            if (!statusEl) {
+                return;
+            }
+
+            try {
+                const response = await fetch("/api/session-status");
+                const data = await response.json();
+
+                if (!response.ok || !data.authenticated) {
+                    statusEl.textContent = "Not signed in.";
+                    statusEl.className = "connection-status error";
+                    return;
+                }
+
+                if (data.calendar_connected) {
+                    statusEl.textContent = "Google Sheets and Calendar connected.";
+                    statusEl.className = "connection-status connected";
+                    return;
+                }
+
+                if (!data.calendar_scope) {
+                    statusEl.textContent = "Sheets connected. Calendar permission missing — log out and sign in again.";
+                    statusEl.className = "connection-status warning";
+                    return;
+                }
+
+                statusEl.textContent = data.calendar_error
+                    ? `Sheets connected. Calendar unavailable: ${data.calendar_error}`
+                    : "Sheets connected. Calendar not available right now.";
+                statusEl.className = "connection-status warning";
+            } catch (error) {
+                statusEl.textContent = "Could not verify Google connection.";
+                statusEl.className = "connection-status error";
+            }
         }
 
+        function logout() {
+            window.location.replace("/logout");
+        }
+
+        loadSessionStatus();
         loadMembers();
         loadSchedule();
         loadKeyEvents();

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Signed Out - Band Availability</title>
+    <style>
+        :root {
+            --bg-deep: #090612;
+            --bg-mid: #15102b;
+            --surface: rgba(28, 20, 52, 0.88);
+            --border: rgba(208, 189, 255, 0.2);
+            --text-primary: #f6f0ff;
+            --text-secondary: #d6c3f9;
+            --accent-violet: #7f5cff;
+            --accent-magenta: #c950c8;
+            --accent-pink: #f278cb;
+            --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            background:
+                radial-gradient(circle at 70% 14%, rgba(242, 120, 203, 0.35), transparent 30%),
+                radial-gradient(circle at 28% 22%, rgba(127, 92, 255, 0.45), transparent 34%),
+                linear-gradient(140deg, var(--bg-deep) 0%, #130c27 45%, var(--bg-mid) 100%);
+        }
+
+        .card {
+            width: min(560px, 100%);
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            box-shadow: var(--shadow);
+            padding: 32px;
+        }
+
+        h1 {
+            font-size: 28px;
+            margin-bottom: 12px;
+        }
+
+        .message,
+        .help {
+            color: var(--text-secondary);
+            line-height: 1.5;
+            margin-bottom: 18px;
+        }
+
+        .primary-btn {
+            border: 1px solid transparent;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            text-decoration: none;
+            display: inline-block;
+            padding: 12px 16px;
+            color: white;
+            background: linear-gradient(120deg, var(--accent-violet), var(--accent-magenta) 60%, var(--accent-pink));
+            transition: transform 0.2s ease;
+        }
+
+        .primary-btn:hover {
+            transform: translateY(-2px);
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Signed out</h1>
+        <p class="message">You have been logged out of Band Availability.</p>
+        <p class="help">Sign in again when you want to update availability or view events.</p>
+        <a class="primary-btn" href="{{ url_for('authorize', retry=1) }}">Sign in with Google</a>
+    </div>
+</body>
+</html>

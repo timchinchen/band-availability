@@ -4,7 +4,7 @@ import os
 os.environ.setdefault('OAUTHLIB_RELAX_TOKEN_SCOPE', '1')
 os.environ.setdefault('OAUTHLIB_INSECURE_TRANSPORT', '1')
 
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, make_response
 from flask_cors import CORS
 import json
 import gc
@@ -21,6 +21,7 @@ os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 warnings.filterwarnings('ignore', message='.*Scope has changed.*')
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -72,7 +73,7 @@ SCHEDULE_LOOKAHEAD_DAYS = 120
 MAX_SCHEDULE_ROWS = 180
 KEY_EVENT_LOOKBACK_DAYS = 7
 KEY_EVENT_LOOKAHEAD_DAYS = 365
-KEY_EVENT_LIMIT = 60
+KEY_EVENT_LIMIT = 100
 KEY_EVENTS_SHEET_RANGE = 'A1:Z2000'
 try:
     SHEET_METADATA_CACHE_SECONDS = int(os.environ.get('SHEET_METADATA_CACHE_SECONDS', '300'))
@@ -168,6 +169,43 @@ def normalize_availability_payload(payload: Dict[str, Any]) -> AvailabilityUpdat
     return AvailabilityUpdate(dates=normalized_dates, status=status)
 
 
+def reset_calendar_backoff():
+    """Clear in-process calendar backoff after a fresh sign-in or manual retry"""
+    global _calendar_retry_after, _calendar_unavailable_reason
+    _calendar_retry_after = None
+    _calendar_unavailable_reason = None
+
+
+def credentials_to_session_dict(credentials: Credentials) -> Dict[str, Any]:
+    """Serialize Google credentials for Flask session storage"""
+    return {
+        'token': credentials.token,
+        'refresh_token': credentials.refresh_token,
+        'token_uri': credentials.token_uri,
+        'client_id': credentials.client_id,
+        'client_secret': credentials.client_secret,
+        'scopes': normalize_granted_scopes(list(credentials.scopes or []))
+    }
+
+
+def get_refreshed_credentials() -> Optional[Credentials]:
+    """Load session credentials and refresh access token when expired"""
+    if 'credentials' not in session:
+        return None
+
+    credentials = Credentials(**session['credentials'])
+    if credentials.expired and credentials.refresh_token:
+        try:
+            credentials.refresh(Request())
+            session['credentials'] = credentials_to_session_dict(credentials)
+        except Exception as refresh_error:
+            print(f"Token refresh failed: {refresh_error}")
+            session.clear()
+            return None
+
+    return credentials
+
+
 def is_calendar_disabled() -> Tuple[bool, Optional[str]]:
     """Check whether calendar calls should be skipped for now"""
     global _calendar_retry_after
@@ -250,19 +288,19 @@ def column_index_to_letter(index: int) -> str:
 
 def get_sheets_service():
     """Get authenticated Google Sheets service"""
-    if 'credentials' not in session:
+    credentials = get_refreshed_credentials()
+    if not credentials:
         return None
-    
-    credentials = Credentials(**session['credentials'])
+
     return build('sheets', 'v4', credentials=credentials, cache_discovery=False)
 
 
 def get_calendar_service():
     """Get authenticated Google Calendar service"""
-    if 'credentials' not in session:
+    credentials = get_refreshed_credentials()
+    if not credentials:
         return None
-    
-    credentials = Credentials(**session['credentials'])
+
     return build('calendar', 'v3', credentials=credentials, cache_discovery=False)
 
 
@@ -342,8 +380,8 @@ def get_sheet_values_for_update(service, sheet_name: str, requested_dates: List[
 
 
 def get_sheet_values_for_event_summary(service, sheet_name: str) -> List[List[str]]:
-    """Read a compact range for key-event extraction."""
-    return get_sheet_values(service, sheet_name, "A1:Z200")
+    """Read enough rows for key-event extraction across the full lookahead window."""
+    return get_sheet_values(service, sheet_name, KEY_EVENTS_SHEET_RANGE)
 
 
 def clear_sheet_name_cache():
@@ -438,9 +476,9 @@ def detect_event_type(text: str) -> Optional[str]:
         return None
     
     lowered = text.lower()
-    if re.search(r"\b(rehearsal|practice|run[- ]through|soundcheck)\b", lowered):
+    if re.search(r"\b(rehearsal|practice|run[- ]through|soundcheck|rehearse)\b", lowered):
         return "rehearsal"
-    if re.search(r"\b(gig|show|festival|wedding|party|performance|concert|function|private event)\b", lowered):
+    if re.search(r"\b(gig|show|festival|wedding|party|performance|concert|function|private event|private party|live|venue|pub|bar|club)\b", lowered):
         return "gig"
     return None
 
@@ -962,9 +1000,37 @@ def update_google_sheet(member_name: str, dates: List[str], status: str):
 def index():
     """Main page"""
     if 'credentials' not in session:
-        return redirect(url_for('authorize'))
+        return redirect(url_for('logged_out'))
 
     return render_template('index.html')
+
+
+@app.route('/logged-out')
+def logged_out():
+    """Show a signed-out landing page without immediately starting OAuth again"""
+    return render_template('logged_out.html')
+
+
+@app.route('/api/session-status', methods=['GET'])
+def session_status():
+    """Report whether Google Sheets/Calendar access is active for this session"""
+    if 'credentials' not in session:
+        return jsonify({'authenticated': False}), 401
+
+    credentials = session.get('credentials', {})
+    scopes = credentials.get('scopes') or []
+    calendar_disabled, calendar_reason = is_calendar_disabled()
+    calendar_scope = CALENDAR_WRITE_SCOPE in scopes or CALENDAR_READONLY_SCOPE in scopes
+
+    return jsonify({
+        'authenticated': True,
+        'calendar_scope': calendar_scope,
+        'calendar_write_scope': CALENDAR_WRITE_SCOPE in scopes,
+        'calendar_connected': calendar_scope and CALENDAR_API_ENABLED and not calendar_disabled,
+        'calendar_enabled': CALENDAR_API_ENABLED,
+        'calendar_error': calendar_reason,
+        'calendar_ids': CALENDAR_IDS,
+    })
 
 
 @app.route('/login-error')
@@ -1054,17 +1120,11 @@ def oauth2callback():
                 'Google sign-in completed without credentials. Please try again.'
             )
 
-        session['credentials'] = {
-            'token': credentials.token,
-            'refresh_token': credentials.refresh_token,
-            'token_uri': credentials.token_uri,
-            'client_id': credentials.client_id,
-            'client_secret': credentials.client_secret,
-            'scopes': normalize_granted_scopes(list(credentials.scopes or []))
-        }
+        session['credentials'] = credentials_to_session_dict(credentials)
 
         clear_oauth_session()
         session.pop('auth_error', None)
+        reset_calendar_backoff()
         print("OAuth credentials stored in session")
         print(f"Credentials: token={credentials.token[:20]}...")
 
@@ -1086,9 +1146,11 @@ def oauth2callback():
 
 @app.route('/logout')
 def logout():
-    """Clear session"""
+    """Clear session and show signed-out page"""
     session.clear()
-    return redirect(url_for('authorize'))
+    response = make_response(redirect(url_for('logged_out')))
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    return response
 
 
 @app.route('/api/members', methods=['GET'])
@@ -1336,11 +1398,7 @@ def sync_key_events_to_calendar():
             return jsonify({'error': 'Not authenticated with Google Calendar'}), 401
 
         sheet_name = get_primary_sheet_name(sheets_service)
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f'{sheet_name}!{KEY_EVENTS_SHEET_RANGE}'
-        ).execute()
-        values = result.get('values', [])
+        values = get_sheet_values_for_event_summary(sheets_service, sheet_name)
 
         sheet_events = summarize_sheet_key_events(
             values,
