@@ -1,8 +1,14 @@
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for
-from flask_cors import CORS
 import os
+
+# Must be set before any oauthlib / google-auth-oauthlib import.
+os.environ.setdefault('OAUTHLIB_RELAX_TOKEN_SCOPE', '1')
+os.environ.setdefault('OAUTHLIB_INSECURE_TRANSPORT', '1')
+
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, make_response
+from flask_cors import CORS
 import json
 import gc
+import warnings
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from dotenv import load_dotenv
 from threading import Lock
@@ -10,15 +16,16 @@ from threading import Lock
 # Load environment variables from .env file
 load_dotenv()
 
-# Allow OAuth over HTTP for local development
-os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
-# Google may return previously granted scopes alongside new ones during upgrades.
+# Keep OAuth scope upgrades from crashing token exchange.
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
+os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+warnings.filterwarnings('ignore', message='.*Scope has changed.*')
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from oauthlib.oauth2.rfc6749.errors import OAuth2Error
+from oauthlib.oauth2.rfc6749.errors import InvalidGrantError, OAuth2Error
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import re
@@ -66,7 +73,7 @@ SCHEDULE_LOOKAHEAD_DAYS = 120
 MAX_SCHEDULE_ROWS = 180
 KEY_EVENT_LOOKBACK_DAYS = 7
 KEY_EVENT_LOOKAHEAD_DAYS = 365
-KEY_EVENT_LIMIT = 60
+KEY_EVENT_LIMIT = 100
 KEY_EVENTS_SHEET_RANGE = 'A1:Z2000'
 try:
     SHEET_METADATA_CACHE_SECONDS = int(os.environ.get('SHEET_METADATA_CACHE_SECONDS', '300'))
@@ -91,6 +98,7 @@ CALENDAR_RETRY_BACKOFF_MINUTES = max(5, min(1440, CALENDAR_RETRY_BACKOFF_MINUTES
 CALENDAR_API_ENABLED = os.environ.get('CALENDAR_API_ENABLED', 'true').strip().lower() not in {'0', 'false', 'no'}
 CALENDAR_TIMEZONE = os.environ.get('CALENDAR_TIMEZONE', 'Europe/London')
 CALENDAR_WRITE_ID = os.environ.get('CALENDAR_WRITE_ID', '').strip() or (CALENDAR_IDS[0] if CALENDAR_IDS else 'primary')
+CALENDAR_API_SETUP_URL = 'https://console.cloud.google.com/apis/library/calendar-json.googleapis.com'
 
 EXCLUDED_MEMBER_HEADERS = {'date', 'event', 'amount', 'notes', 'venue'}
 
@@ -162,6 +170,43 @@ def normalize_availability_payload(payload: Dict[str, Any]) -> AvailabilityUpdat
     return AvailabilityUpdate(dates=normalized_dates, status=status)
 
 
+def reset_calendar_backoff():
+    """Clear in-process calendar backoff after a fresh sign-in or manual retry"""
+    global _calendar_retry_after, _calendar_unavailable_reason
+    _calendar_retry_after = None
+    _calendar_unavailable_reason = None
+
+
+def credentials_to_session_dict(credentials: Credentials) -> Dict[str, Any]:
+    """Serialize Google credentials for Flask session storage"""
+    return {
+        'token': credentials.token,
+        'refresh_token': credentials.refresh_token,
+        'token_uri': credentials.token_uri,
+        'client_id': credentials.client_id,
+        'client_secret': credentials.client_secret,
+        'scopes': normalize_granted_scopes(list(credentials.scopes or []))
+    }
+
+
+def get_refreshed_credentials() -> Optional[Credentials]:
+    """Load session credentials and refresh access token when expired"""
+    if 'credentials' not in session:
+        return None
+
+    credentials = Credentials(**session['credentials'])
+    if credentials.expired and credentials.refresh_token:
+        try:
+            credentials.refresh(Request())
+            session['credentials'] = credentials_to_session_dict(credentials)
+        except Exception as refresh_error:
+            print(f"Token refresh failed: {refresh_error}")
+            session.clear()
+            return None
+
+    return credentials
+
+
 def is_calendar_disabled() -> Tuple[bool, Optional[str]]:
     """Check whether calendar calls should be skipped for now"""
     global _calendar_retry_after
@@ -207,6 +252,35 @@ def should_disable_calendar_after_error(error: Exception) -> Optional[str]:
     return None
 
 
+def is_calendar_setup_error(reason: Optional[str]) -> bool:
+    """Whether calendar failed because the API must be enabled in Google Cloud"""
+    if not reason:
+        return False
+    lowered = reason.lower()
+    return (
+        'not enabled' in lowered
+        or 'accessnotconfigured' in lowered
+        or 'has not been used in project' in lowered
+    )
+
+
+def record_calendar_failure(error: Exception) -> str:
+    """Store calendar failure details and backoff only for transient errors"""
+    disable_reason = should_disable_calendar_after_error(error)
+    if disable_reason:
+        if is_calendar_setup_error(disable_reason):
+            return (
+                f"{disable_reason}. Enable it in Google Cloud Console, wait a minute, "
+                "then refresh this page."
+            )
+        disable_calendar_temporarily(disable_reason)
+        return (
+            f"{disable_reason}. Backing off calendar requests for "
+            f"{CALENDAR_RETRY_BACKOFF_MINUTES} minute(s)."
+        )
+    return str(error)
+
+
 def filter_member_headers(headers: List[str]) -> List[str]:
     """Return only real member columns, excluding metadata columns"""
     members: List[str] = []
@@ -244,19 +318,19 @@ def column_index_to_letter(index: int) -> str:
 
 def get_sheets_service():
     """Get authenticated Google Sheets service"""
-    if 'credentials' not in session:
+    credentials = get_refreshed_credentials()
+    if not credentials:
         return None
-    
-    credentials = Credentials(**session['credentials'])
+
     return build('sheets', 'v4', credentials=credentials, cache_discovery=False)
 
 
 def get_calendar_service():
     """Get authenticated Google Calendar service"""
-    if 'credentials' not in session:
+    credentials = get_refreshed_credentials()
+    if not credentials:
         return None
-    
-    credentials = Credentials(**session['credentials'])
+
     return build('calendar', 'v3', credentials=credentials, cache_discovery=False)
 
 
@@ -336,8 +410,8 @@ def get_sheet_values_for_update(service, sheet_name: str, requested_dates: List[
 
 
 def get_sheet_values_for_event_summary(service, sheet_name: str) -> List[List[str]]:
-    """Read a compact range for key-event extraction."""
-    return get_sheet_values(service, sheet_name, "A1:Z200")
+    """Read enough rows for key-event extraction across the full lookahead window."""
+    return get_sheet_values(service, sheet_name, KEY_EVENTS_SHEET_RANGE)
 
 
 def clear_sheet_name_cache():
@@ -432,9 +506,9 @@ def detect_event_type(text: str) -> Optional[str]:
         return None
     
     lowered = text.lower()
-    if re.search(r"\b(rehearsal|practice|run[- ]through|soundcheck)\b", lowered):
+    if re.search(r"\b(rehearsal|practice|run[- ]through|soundcheck|rehearse)\b", lowered):
         return "rehearsal"
-    if re.search(r"\b(gig|show|festival|wedding|party|performance|concert|function|private event)\b", lowered):
+    if re.search(r"\b(gig|show|festival|wedding|party|performance|concert|function|private event|private party|live|venue|pub|bar|club)\b", lowered):
         return "gig"
     return None
 
@@ -781,26 +855,30 @@ def normalize_granted_scopes(scopes: Optional[List[str]]) -> List[str]:
 def clear_oauth_session():
     """Remove temporary OAuth state used during sign-in"""
     session.pop('oauth_state', None)
-    session.pop('oauth_code_verifier', None)
     session.pop('state', None)
 
 
-def store_oauth_flow_state(flow: Flow, state: str):
-    """Persist PKCE verifier and state across the Google redirect"""
+def oauth_failed(message: str):
+    """Clear the session and send the user to a recoverable sign-in error page"""
+    session.clear()
+    session['auth_error'] = message
+    return redirect(url_for('login_error'))
+
+
+def store_oauth_flow_state(state: str):
+    """Persist OAuth state across the Google redirect"""
     session['oauth_state'] = state
-    session['oauth_code_verifier'] = flow.code_verifier
     session['state'] = state
 
 
-def build_oauth_flow(state: Optional[str] = None, code_verifier: Optional[str] = None) -> Flow:
-    """Create an OAuth flow configured for this app"""
+def build_oauth_flow(state: Optional[str] = None) -> Flow:
+    """Create an OAuth flow configured for this confidential web client"""
     return Flow.from_client_config(
         CLIENT_CONFIG,
         scopes=SCOPES,
         state=state,
         redirect_uri=url_for('oauth2callback', _external=True),
-        code_verifier=code_verifier,
-        autogenerate_code_verifier=code_verifier is None
+        autogenerate_code_verifier=False,
     )
 
 
@@ -952,9 +1030,49 @@ def update_google_sheet(member_name: str, dates: List[str], status: str):
 def index():
     """Main page"""
     if 'credentials' not in session:
-        return redirect(url_for('authorize'))
-    
+        return redirect(url_for('logged_out'))
+
     return render_template('index.html')
+
+
+@app.route('/logged-out')
+def logged_out():
+    """Show a signed-out landing page without immediately starting OAuth again"""
+    return render_template('logged_out.html')
+
+
+@app.route('/api/session-status', methods=['GET'])
+def session_status():
+    """Report whether Google Sheets/Calendar access is active for this session"""
+    if 'credentials' not in session:
+        return jsonify({'authenticated': False}), 401
+
+    credentials = session.get('credentials', {})
+    scopes = credentials.get('scopes') or []
+    calendar_disabled, calendar_reason = is_calendar_disabled()
+    calendar_scope = CALENDAR_WRITE_SCOPE in scopes or CALENDAR_READONLY_SCOPE in scopes
+
+    return jsonify({
+        'authenticated': True,
+        'calendar_scope': calendar_scope,
+        'calendar_write_scope': CALENDAR_WRITE_SCOPE in scopes,
+        'calendar_connected': calendar_scope and CALENDAR_API_ENABLED and not calendar_disabled,
+        'calendar_enabled': CALENDAR_API_ENABLED,
+        'calendar_error': calendar_reason,
+        'calendar_setup_required': is_calendar_setup_error(calendar_reason),
+        'calendar_setup_url': CALENDAR_API_SETUP_URL,
+        'calendar_ids': CALENDAR_IDS,
+    })
+
+
+@app.route('/login-error')
+def login_error():
+    """Show a recoverable Google sign-in failure"""
+    message = session.pop(
+        'auth_error',
+        'Google sign-in failed. Please try again.'
+    )
+    return render_template('login_error.html', message=message)
 
 
 @app.route('/authorize')
@@ -964,89 +1082,107 @@ def authorize():
     clear_oauth_session()
     flow = build_oauth_flow()
 
-    authorization_url, state = flow.authorization_url(
-        access_type='offline'
-    )
+    auth_kwargs = {'access_type': 'offline'}
+    if request.args.get('retry') == '1':
+        auth_kwargs['prompt'] = 'consent'
+
+    authorization_url, state = flow.authorization_url(**auth_kwargs)
 
     print(f"Redirect URI: {url_for('oauth2callback', _external=True)}")
     print(f"Authorization URL: {authorization_url}")
 
-    store_oauth_flow_state(flow, state)
+    store_oauth_flow_state(state)
     return redirect(authorization_url)
 
 
-@app.route('/oauth2callback', methods=['GET'])
+@app.route('/oauth2callback', methods=['GET', 'HEAD'])
 def oauth2callback():
     """OAuth callback"""
+    if request.method == 'HEAD':
+        return '', 200
+
     print("=== OAUTH CALLBACK RECEIVED ===")
+    print(f"Request method: {request.method}")
     print(f"Request URL: {request.url}")
     print(f"Session state: {session.get('oauth_state', session.get('state', 'NOT FOUND'))}")
 
-    oauth_error = request.args.get('error')
-    if oauth_error:
-        print(
-            "OAuth denied:",
-            oauth_error,
-            request.args.get('error_description', '')
-        )
-        clear_oauth_session()
-        return redirect(url_for('authorize'))
-
-    if not request.args.get('code'):
-        print("OAuth callback missing authorization code")
-        clear_oauth_session()
-        return redirect(url_for('authorize'))
-
-    state = session.get('oauth_state') or session.get('state')
-    code_verifier = session.get('oauth_code_verifier')
-    callback_state = request.args.get('state')
-
-    if not state or not code_verifier:
-        print("OAuth callback missing session PKCE state")
-        clear_oauth_session()
-        return redirect(url_for('authorize'))
-
-    if callback_state != state:
-        print(f"OAuth state mismatch: session={state}, callback={callback_state}")
-        clear_oauth_session()
-        return redirect(url_for('authorize'))
-
-    flow = build_oauth_flow(state=state, code_verifier=code_verifier)
-
     try:
-        flow.fetch_token(authorization_response=request.url)
-    except OAuth2Error as oauth_exception:
-        print(f"OAuth token exchange failed: {oauth_exception}")
+        oauth_error = request.args.get('error')
+        if oauth_error:
+            print(
+                "OAuth denied:",
+                oauth_error,
+                request.args.get('error_description', '')
+            )
+            return oauth_failed(
+                'Google sign-in was cancelled or denied. Please try again.'
+            )
+
+        if not request.args.get('code'):
+            print("OAuth callback missing authorization code")
+            return oauth_failed(
+                'Google sign-in did not return an authorization code. Please try again.'
+            )
+
+        state = session.get('oauth_state') or session.get('state')
+        callback_state = request.args.get('state')
+
+        if not state:
+            print("OAuth callback missing session state")
+            return oauth_failed(
+                'Your sign-in session expired before Google redirected back. Please try again.'
+            )
+
+        if callback_state != state:
+            print(f"OAuth state mismatch: session={state}, callback={callback_state}")
+            return oauth_failed(
+                'Google sign-in could not be verified. Please try again.'
+            )
+
+        flow = build_oauth_flow(state=state)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            flow.fetch_token(authorization_response=request.url)
+
+        credentials = flow.credentials
+        if not credentials or not credentials.token:
+            print("OAuth callback returned no credentials")
+            return oauth_failed(
+                'Google sign-in completed without credentials. Please try again.'
+            )
+
+        session['credentials'] = credentials_to_session_dict(credentials)
+
         clear_oauth_session()
-        return redirect(url_for('authorize'))
+        session.pop('auth_error', None)
+        reset_calendar_backoff()
+        print("OAuth credentials stored in session")
+        print(f"Credentials: token={credentials.token[:20]}...")
+
+        return redirect(url_for('index'))
+    except (InvalidGrantError, OAuth2Error, Warning) as oauth_exception:
+        print(f"OAuth token exchange failed: {oauth_exception}")
+        return oauth_failed(
+            'Google could not complete sign-in. Please use Sign in again below. '
+            'If this keeps happening, remove Band Availability from your Google Account permissions and retry.'
+        )
     except Exception as oauth_exception:
         print(f"OAuth callback failed: {oauth_exception}")
-        clear_oauth_session()
-        return redirect(url_for('authorize'))
-
-    credentials = flow.credentials
-    session['credentials'] = {
-        'token': credentials.token,
-        'refresh_token': credentials.refresh_token,
-        'token_uri': credentials.token_uri,
-        'client_id': credentials.client_id,
-        'client_secret': credentials.client_secret,
-        'scopes': normalize_granted_scopes(list(credentials.scopes or []))
-    }
-
-    clear_oauth_session()
-    print("OAuth credentials stored in session")
-    print(f"Credentials: token={credentials.token[:20]}...")
-
-    return redirect(url_for('index'))
+        import traceback
+        traceback.print_exc()
+        return oauth_failed(
+            'Something went wrong during Google sign-in. Please try again.'
+        )
 
 
 @app.route('/logout')
 def logout():
-    """Clear session"""
-    clear_oauth_session()
+    """Clear session and show signed-out page"""
     session.clear()
-    return redirect(url_for('index'))
+    response = make_response(redirect(url_for('logged_out')))
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    return response
 
 
 @app.route('/api/members', methods=['GET'])
@@ -1217,15 +1353,7 @@ def key_events():
                         lookahead_days=lookahead_days
                     )
                 except Exception as calendar_exception:
-                    disable_reason = should_disable_calendar_after_error(calendar_exception)
-                    if disable_reason:
-                        disable_calendar_temporarily(disable_reason)
-                        calendar_error = (
-                            f"{disable_reason}. Backing off calendar requests for "
-                            f"{CALENDAR_RETRY_BACKOFF_MINUTES} minute(s)."
-                        )
-                    else:
-                        calendar_error = str(calendar_exception)
+                    calendar_error = record_calendar_failure(calendar_exception)
                     print(f"Calendar summary warning: {calendar_error}")
         
         combined_events = combine_key_events(calendar_events, sheet_events)
@@ -1252,9 +1380,12 @@ def key_events():
                 'lookahead_days': lookahead_days,
                 'limit': limit,
                 'matched_total': len(combined_events),
-                'returned_total': len(events)
+                'returned_total': len(events),
+                'sheet_rows_scanned': max(0, len(values) - 1) if values else 0
             },
             'calendar_error': calendar_error,
+            'calendar_setup_required': is_calendar_setup_error(calendar_error),
+            'calendar_setup_url': CALENDAR_API_SETUP_URL,
             'calendar_disabled': bool(calendar_error and not calendar_events)
         })
     
@@ -1283,7 +1414,11 @@ def sync_key_events_to_calendar():
 
         calendar_disabled, disabled_reason = is_calendar_disabled()
         if calendar_disabled:
-            return jsonify({'error': disabled_reason or 'Calendar integration is unavailable'}), 503
+            return jsonify({
+                'error': disabled_reason or 'Calendar integration is unavailable',
+                'calendar_setup_required': is_calendar_setup_error(disabled_reason),
+                'calendar_setup_url': CALENDAR_API_SETUP_URL,
+            }), 503
 
         sheets_service = get_sheets_service()
         if not sheets_service:
@@ -1294,11 +1429,7 @@ def sync_key_events_to_calendar():
             return jsonify({'error': 'Not authenticated with Google Calendar'}), 401
 
         sheet_name = get_primary_sheet_name(sheets_service)
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f'{sheet_name}!{KEY_EVENTS_SHEET_RANGE}'
-        ).execute()
-        values = result.get('values', [])
+        values = get_sheet_values_for_event_summary(sheets_service, sheet_name)
 
         sheet_events = summarize_sheet_key_events(
             values,
@@ -1320,10 +1451,12 @@ def sync_key_events_to_calendar():
                 lookahead_days=KEY_EVENT_LOOKAHEAD_DAYS
             )
         except Exception as calendar_exception:
-            disable_reason = should_disable_calendar_after_error(calendar_exception)
-            if disable_reason:
-                disable_calendar_temporarily(disable_reason)
-            raise
+            calendar_error = record_calendar_failure(calendar_exception)
+            return jsonify({
+                'error': calendar_error,
+                'calendar_setup_required': is_calendar_setup_error(calendar_error),
+                'calendar_setup_url': CALENDAR_API_SETUP_URL,
+            }), 503
 
         sync_result = sync_sheet_events_to_calendar(
             calendar_service,
