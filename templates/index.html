@@ -282,6 +282,24 @@
             display: flex;
             gap: 8px;
             flex-wrap: wrap;
+            margin-bottom: 14px;
+        }
+
+        .calendar-alert {
+            display: none;
+            border: 1px solid rgba(255, 143, 178, 0.45);
+            background: rgba(255, 143, 178, 0.12);
+            color: #ffd4e4;
+            border-radius: 12px;
+            padding: 12px 14px;
+            margin-bottom: 14px;
+            font-size: 13px;
+            line-height: 1.45;
+        }
+
+        .calendar-alert a {
+            color: #fff4fa;
+            font-weight: 600;
         }
 
         .count-pill {
@@ -580,6 +598,8 @@
                     </div>
                 </div>
 
+                <div class="calendar-alert" id="calendarAlert"></div>
+
                 <div class="event-counts">
                     <span class="count-pill rehearsal" id="rehearsalCount">Rehearsals: -</span>
                     <span class="count-pill gig" id="gigCount">Gigs: -</span>
@@ -821,6 +841,25 @@
             }
         }
 
+        function showCalendarAlert(message, setupUrl) {
+            const alertEl = document.getElementById("calendarAlert");
+            if (!alertEl) {
+                return;
+            }
+
+            if (!message) {
+                alertEl.style.display = "none";
+                alertEl.innerHTML = "";
+                return;
+            }
+
+            const link = setupUrl
+                ? ` <a href="${escapeHtml(setupUrl)}" target="_blank" rel="noopener noreferrer">Open Google Cloud Console</a>`
+                : "";
+            alertEl.innerHTML = `${escapeHtml(message)}${link}`;
+            alertEl.style.display = "block";
+        }
+
         async function loadKeyEvents() {
             const eventsList = document.getElementById("eventsList");
             const rehearsalCount = document.getElementById("rehearsalCount");
@@ -872,10 +911,19 @@
                 eventSourceInfo.textContent =
                     `Showing ${windowInfo.returned_total ?? data.events.length} of ` +
                     `${windowInfo.matched_total ?? data.events.length} event(s) ` +
-                    `(window: -${windowInfo.lookback_days ?? "?"} / +${windowInfo.lookahead_days ?? "?"} days). ` +
+                    `(window: -${windowInfo.lookback_days ?? "?"} / +${windowInfo.lookahead_days ?? "?"} days, ` +
+                    `${windowInfo.sheet_rows_scanned ?? "?"} sheet rows scanned). ` +
                     `Loaded ${calendarCount} calendar and ${sheetCount} sheet event(s) in range.`;
                 if (data.calendar_error) {
                     eventSourceInfo.textContent += ` Calendar: ${data.calendar_error}`;
+                }
+                if (data.calendar_setup_required) {
+                    showCalendarAlert(
+                        "Google Calendar API is not enabled for this app's Google Cloud project. Enable it, wait a minute, then click Refresh.",
+                        data.calendar_setup_url
+                    );
+                } else {
+                    showCalendarAlert("");
                 }
             } catch (error) {
                 console.error("Error loading key events:", error);
@@ -901,6 +949,9 @@
                 const data = await response.json();
 
                 if (!response.ok) {
+                    if (data.calendar_setup_required) {
+                        showCalendarAlert(data.error, data.calendar_setup_url);
+                    }
                     if (data.reauthorize_required) {
                         throw new Error(`${data.error} Use Logout, then sign in again.`);
                     }
@@ -982,6 +1033,18 @@
                 if (!data.calendar_scope) {
                     statusEl.textContent = "Sheets connected. Calendar permission missing — log out and sign in again.";
                     statusEl.className = "connection-status warning";
+                    return;
+                }
+
+                if (data.calendar_setup_required) {
+                    statusEl.innerHTML =
+                        'Sheets connected. Enable the <a href="' + escapeHtml(data.calendar_setup_url || '#') +
+                        '" target="_blank" rel="noopener noreferrer">Google Calendar API</a> in Cloud Console.';
+                    statusEl.className = "connection-status warning";
+                    showCalendarAlert(
+                        "Google Calendar API is not enabled for this app's Google Cloud project.",
+                        data.calendar_setup_url
+                    );
                     return;
                 }
 

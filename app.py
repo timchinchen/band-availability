@@ -98,6 +98,7 @@ CALENDAR_RETRY_BACKOFF_MINUTES = max(5, min(1440, CALENDAR_RETRY_BACKOFF_MINUTES
 CALENDAR_API_ENABLED = os.environ.get('CALENDAR_API_ENABLED', 'true').strip().lower() not in {'0', 'false', 'no'}
 CALENDAR_TIMEZONE = os.environ.get('CALENDAR_TIMEZONE', 'Europe/London')
 CALENDAR_WRITE_ID = os.environ.get('CALENDAR_WRITE_ID', '').strip() or (CALENDAR_IDS[0] if CALENDAR_IDS else 'primary')
+CALENDAR_API_SETUP_URL = 'https://console.cloud.google.com/apis/library/calendar-json.googleapis.com'
 
 EXCLUDED_MEMBER_HEADERS = {'date', 'event', 'amount', 'notes', 'venue'}
 
@@ -249,6 +250,35 @@ def should_disable_calendar_after_error(error: Exception) -> Optional[str]:
             return "Google Calendar service unavailable"
 
     return None
+
+
+def is_calendar_setup_error(reason: Optional[str]) -> bool:
+    """Whether calendar failed because the API must be enabled in Google Cloud"""
+    if not reason:
+        return False
+    lowered = reason.lower()
+    return (
+        'not enabled' in lowered
+        or 'accessnotconfigured' in lowered
+        or 'has not been used in project' in lowered
+    )
+
+
+def record_calendar_failure(error: Exception) -> str:
+    """Store calendar failure details and backoff only for transient errors"""
+    disable_reason = should_disable_calendar_after_error(error)
+    if disable_reason:
+        if is_calendar_setup_error(disable_reason):
+            return (
+                f"{disable_reason}. Enable it in Google Cloud Console, wait a minute, "
+                "then refresh this page."
+            )
+        disable_calendar_temporarily(disable_reason)
+        return (
+            f"{disable_reason}. Backing off calendar requests for "
+            f"{CALENDAR_RETRY_BACKOFF_MINUTES} minute(s)."
+        )
+    return str(error)
 
 
 def filter_member_headers(headers: List[str]) -> List[str]:
@@ -1029,6 +1059,8 @@ def session_status():
         'calendar_connected': calendar_scope and CALENDAR_API_ENABLED and not calendar_disabled,
         'calendar_enabled': CALENDAR_API_ENABLED,
         'calendar_error': calendar_reason,
+        'calendar_setup_required': is_calendar_setup_error(calendar_reason),
+        'calendar_setup_url': CALENDAR_API_SETUP_URL,
         'calendar_ids': CALENDAR_IDS,
     })
 
@@ -1321,15 +1353,7 @@ def key_events():
                         lookahead_days=lookahead_days
                     )
                 except Exception as calendar_exception:
-                    disable_reason = should_disable_calendar_after_error(calendar_exception)
-                    if disable_reason:
-                        disable_calendar_temporarily(disable_reason)
-                        calendar_error = (
-                            f"{disable_reason}. Backing off calendar requests for "
-                            f"{CALENDAR_RETRY_BACKOFF_MINUTES} minute(s)."
-                        )
-                    else:
-                        calendar_error = str(calendar_exception)
+                    calendar_error = record_calendar_failure(calendar_exception)
                     print(f"Calendar summary warning: {calendar_error}")
         
         combined_events = combine_key_events(calendar_events, sheet_events)
@@ -1356,9 +1380,12 @@ def key_events():
                 'lookahead_days': lookahead_days,
                 'limit': limit,
                 'matched_total': len(combined_events),
-                'returned_total': len(events)
+                'returned_total': len(events),
+                'sheet_rows_scanned': max(0, len(values) - 1) if values else 0
             },
             'calendar_error': calendar_error,
+            'calendar_setup_required': is_calendar_setup_error(calendar_error),
+            'calendar_setup_url': CALENDAR_API_SETUP_URL,
             'calendar_disabled': bool(calendar_error and not calendar_events)
         })
     
@@ -1387,7 +1414,11 @@ def sync_key_events_to_calendar():
 
         calendar_disabled, disabled_reason = is_calendar_disabled()
         if calendar_disabled:
-            return jsonify({'error': disabled_reason or 'Calendar integration is unavailable'}), 503
+            return jsonify({
+                'error': disabled_reason or 'Calendar integration is unavailable',
+                'calendar_setup_required': is_calendar_setup_error(disabled_reason),
+                'calendar_setup_url': CALENDAR_API_SETUP_URL,
+            }), 503
 
         sheets_service = get_sheets_service()
         if not sheets_service:
@@ -1420,10 +1451,12 @@ def sync_key_events_to_calendar():
                 lookahead_days=KEY_EVENT_LOOKAHEAD_DAYS
             )
         except Exception as calendar_exception:
-            disable_reason = should_disable_calendar_after_error(calendar_exception)
-            if disable_reason:
-                disable_calendar_temporarily(disable_reason)
-            raise
+            calendar_error = record_calendar_failure(calendar_exception)
+            return jsonify({
+                'error': calendar_error,
+                'calendar_setup_required': is_calendar_setup_error(calendar_error),
+                'calendar_setup_url': CALENDAR_API_SETUP_URL,
+            }), 503
 
         sync_result = sync_sheet_events_to_calendar(
             calendar_service,
