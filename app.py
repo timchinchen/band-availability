@@ -177,25 +177,67 @@ def reset_calendar_backoff():
     _calendar_unavailable_reason = None
 
 
+def get_oauth_client_config() -> Dict[str, Any]:
+    """Return the installed/web OAuth client section from CLIENT_CONFIG."""
+    return CLIENT_CONFIG.get('web') or CLIENT_CONFIG.get('installed') or {}
+
+
+def enrich_credentials_dict(stored: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure stored credentials include fields required for token refresh."""
+    client = get_oauth_client_config()
+    return {
+        'token': stored.get('token'),
+        'refresh_token': stored.get('refresh_token'),
+        'token_uri': stored.get('token_uri') or client.get('token_uri', 'https://oauth2.googleapis.com/token'),
+        'client_id': stored.get('client_id') or client.get('client_id'),
+        'client_secret': stored.get('client_secret') or client.get('client_secret'),
+        'scopes': stored.get('scopes') or list(SCOPES),
+    }
+
+
 def credentials_to_session_dict(credentials: Credentials) -> Dict[str, Any]:
     """Serialize Google credentials for Flask session storage"""
-    return {
+    return enrich_credentials_dict({
         'token': credentials.token,
         'refresh_token': credentials.refresh_token,
         'token_uri': credentials.token_uri,
         'client_id': credentials.client_id,
         'client_secret': credentials.client_secret,
         'scopes': normalize_granted_scopes(list(credentials.scopes or []))
-    }
+    })
+
+
+def credentials_from_session() -> Optional[Credentials]:
+    """Build Google credentials from the Flask session with client config fallbacks."""
+    if 'credentials' not in session:
+        return None
+
+    enriched = enrich_credentials_dict(session['credentials'])
+    return Credentials(**enriched)
 
 
 def get_refreshed_credentials() -> Optional[Credentials]:
     """Load session credentials and refresh access token when expired"""
-    if 'credentials' not in session:
+    credentials = credentials_from_session()
+    if not credentials:
         return None
 
-    credentials = Credentials(**session['credentials'])
-    if credentials.expired and credentials.refresh_token:
+    if not credentials.valid:
+        if not credentials.refresh_token:
+            print("Session credentials expired without refresh_token; re-auth required")
+            session.clear()
+            return None
+
+        required_fields = (
+            credentials.token_uri,
+            credentials.client_id,
+            credentials.client_secret,
+        )
+        if not all(required_fields):
+            print("Session credentials missing OAuth client fields; re-auth required")
+            session.clear()
+            return None
+
         try:
             credentials.refresh(Request())
             session['credentials'] = credentials_to_session_dict(credentials)
@@ -1082,9 +1124,11 @@ def authorize():
     clear_oauth_session()
     flow = build_oauth_flow()
 
-    auth_kwargs = {'access_type': 'offline'}
-    if request.args.get('retry') == '1':
-        auth_kwargs['prompt'] = 'consent'
+    auth_kwargs = {
+        'access_type': 'offline',
+        'prompt': 'consent',
+        'include_granted_scopes': 'true',
+    }
 
     authorization_url, state = flow.authorization_url(**auth_kwargs)
 
@@ -1152,7 +1196,19 @@ def oauth2callback():
                 'Google sign-in completed without credentials. Please try again.'
             )
 
-        session['credentials'] = credentials_to_session_dict(credentials)
+        stored_credentials = credentials_to_session_dict(credentials)
+        existing_credentials = session.get('credentials') or {}
+        if not stored_credentials.get('refresh_token') and existing_credentials.get('refresh_token'):
+            stored_credentials['refresh_token'] = existing_credentials['refresh_token']
+
+        if not stored_credentials.get('refresh_token'):
+            print("OAuth callback returned no refresh_token")
+            return oauth_failed(
+                'Google did not return a refresh token. Remove this app from your Google Account '
+                'permissions, then sign in again using Sign in again.'
+            )
+
+        session['credentials'] = stored_credentials
 
         clear_oauth_session()
         session.pop('auth_error', None)
