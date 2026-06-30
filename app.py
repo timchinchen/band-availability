@@ -24,7 +24,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from oauthlib.oauth2.rfc6749.errors import OAuth2Error
+from oauthlib.oauth2.rfc6749.errors import InvalidGrantError, OAuth2Error
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import re
@@ -44,13 +44,6 @@ CORS(app)
 if os.getenv('RENDER') or os.getenv('HEROKU'):
     from werkzeug.middleware.proxy_fix import ProxyFix
     app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-
-
-@app.before_request
-def ignore_oauth_callback_head():
-    """Browsers may prefetch the OAuth callback with HEAD and burn one-time codes."""
-    if request.path == '/oauth2callback' and request.method == 'HEAD':
-        return '', 200
 
 # Keep Google API client behavior lightweight for low-memory hosts.
 os.environ.setdefault('GOOGLE_API_USE_MTLS_ENDPOINT', 'never')
@@ -794,7 +787,6 @@ def normalize_granted_scopes(scopes: Optional[List[str]]) -> List[str]:
 def clear_oauth_session():
     """Remove temporary OAuth state used during sign-in"""
     session.pop('oauth_state', None)
-    session.pop('oauth_code_verifier', None)
     session.pop('state', None)
 
 
@@ -805,22 +797,20 @@ def oauth_failed(message: str):
     return redirect(url_for('login_error'))
 
 
-def store_oauth_flow_state(flow: Flow, state: str):
-    """Persist PKCE verifier and state across the Google redirect"""
+def store_oauth_flow_state(state: str):
+    """Persist OAuth state across the Google redirect"""
     session['oauth_state'] = state
-    session['oauth_code_verifier'] = flow.code_verifier
     session['state'] = state
 
 
-def build_oauth_flow(state: Optional[str] = None, code_verifier: Optional[str] = None) -> Flow:
-    """Create an OAuth flow configured for this app"""
+def build_oauth_flow(state: Optional[str] = None) -> Flow:
+    """Create an OAuth flow configured for this confidential web client"""
     return Flow.from_client_config(
         CLIENT_CONFIG,
         scopes=SCOPES,
         state=state,
         redirect_uri=url_for('oauth2callback', _external=True),
-        code_verifier=code_verifier,
-        autogenerate_code_verifier=code_verifier is None
+        autogenerate_code_verifier=False,
     )
 
 
@@ -1003,61 +993,83 @@ def authorize():
     print(f"Redirect URI: {url_for('oauth2callback', _external=True)}")
     print(f"Authorization URL: {authorization_url}")
 
-    store_oauth_flow_state(flow, state)
+    store_oauth_flow_state(state)
     return redirect(authorization_url)
 
 
-@app.route('/oauth2callback', methods=['GET'])
+@app.route('/oauth2callback', methods=['GET', 'HEAD'])
 def oauth2callback():
     """OAuth callback"""
-    if request.method != 'GET':
-        return '', 204
+    if request.method == 'HEAD':
+        return '', 200
 
     print("=== OAUTH CALLBACK RECEIVED ===")
     print(f"Request method: {request.method}")
     print(f"Request URL: {request.url}")
     print(f"Session state: {session.get('oauth_state', session.get('state', 'NOT FOUND'))}")
 
-    oauth_error = request.args.get('error')
-    if oauth_error:
-        print(
-            "OAuth denied:",
-            oauth_error,
-            request.args.get('error_description', '')
-        )
-        return oauth_failed(
-            'Google sign-in was cancelled or denied. Please try again.'
-        )
-
-    if not request.args.get('code'):
-        print("OAuth callback missing authorization code")
-        return oauth_failed(
-            'Google sign-in did not return an authorization code. Please try again.'
-        )
-
-    state = session.get('oauth_state') or session.get('state')
-    code_verifier = session.get('oauth_code_verifier')
-    callback_state = request.args.get('state')
-
-    if not state or not code_verifier:
-        print("OAuth callback missing session PKCE state")
-        return oauth_failed(
-            'Your sign-in session expired before Google redirected back. Please try again.'
-        )
-
-    if callback_state != state:
-        print(f"OAuth state mismatch: session={state}, callback={callback_state}")
-        return oauth_failed(
-            'Google sign-in could not be verified. Please try again.'
-        )
-
-    flow = build_oauth_flow(state=state, code_verifier=code_verifier)
-
     try:
+        oauth_error = request.args.get('error')
+        if oauth_error:
+            print(
+                "OAuth denied:",
+                oauth_error,
+                request.args.get('error_description', '')
+            )
+            return oauth_failed(
+                'Google sign-in was cancelled or denied. Please try again.'
+            )
+
+        if not request.args.get('code'):
+            print("OAuth callback missing authorization code")
+            return oauth_failed(
+                'Google sign-in did not return an authorization code. Please try again.'
+            )
+
+        state = session.get('oauth_state') or session.get('state')
+        callback_state = request.args.get('state')
+
+        if not state:
+            print("OAuth callback missing session state")
+            return oauth_failed(
+                'Your sign-in session expired before Google redirected back. Please try again.'
+            )
+
+        if callback_state != state:
+            print(f"OAuth state mismatch: session={state}, callback={callback_state}")
+            return oauth_failed(
+                'Google sign-in could not be verified. Please try again.'
+            )
+
+        flow = build_oauth_flow(state=state)
+
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
             flow.fetch_token(authorization_response=request.url)
-    except (OAuth2Error, Warning) as oauth_exception:
+
+        credentials = flow.credentials
+        if not credentials or not credentials.token:
+            print("OAuth callback returned no credentials")
+            return oauth_failed(
+                'Google sign-in completed without credentials. Please try again.'
+            )
+
+        session['credentials'] = {
+            'token': credentials.token,
+            'refresh_token': credentials.refresh_token,
+            'token_uri': credentials.token_uri,
+            'client_id': credentials.client_id,
+            'client_secret': credentials.client_secret,
+            'scopes': normalize_granted_scopes(list(credentials.scopes or []))
+        }
+
+        clear_oauth_session()
+        session.pop('auth_error', None)
+        print("OAuth credentials stored in session")
+        print(f"Credentials: token={credentials.token[:20]}...")
+
+        return redirect(url_for('index'))
+    except (InvalidGrantError, OAuth2Error, Warning) as oauth_exception:
         print(f"OAuth token exchange failed: {oauth_exception}")
         return oauth_failed(
             'Google could not complete sign-in. Please use Sign in again below. '
@@ -1065,32 +1077,11 @@ def oauth2callback():
         )
     except Exception as oauth_exception:
         print(f"OAuth callback failed: {oauth_exception}")
+        import traceback
+        traceback.print_exc()
         return oauth_failed(
             'Something went wrong during Google sign-in. Please try again.'
         )
-
-    credentials = flow.credentials
-    if not credentials or not credentials.token:
-        print("OAuth callback returned no credentials")
-        return oauth_failed(
-            'Google sign-in completed without credentials. Please try again.'
-        )
-
-    session['credentials'] = {
-        'token': credentials.token,
-        'refresh_token': credentials.refresh_token,
-        'token_uri': credentials.token_uri,
-        'client_id': credentials.client_id,
-        'client_secret': credentials.client_secret,
-        'scopes': normalize_granted_scopes(list(credentials.scopes or []))
-    }
-
-    clear_oauth_session()
-    session.pop('auth_error', None)
-    print("OAuth credentials stored in session")
-    print(f"Credentials: token={credentials.token[:20]}...")
-
-    return redirect(url_for('index'))
 
 
 @app.route('/logout')
